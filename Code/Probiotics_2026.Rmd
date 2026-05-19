@@ -1,0 +1,1955 @@
+---
+title: "in vitro modeling of the intestinal microbiota predicts individualized probiotic response in metabolic syndrome"
+author: "Quentin Lamy-Besnier"
+date: "`r Sys.Date()`"
+output: 
+  html_document: 
+    fig_caption: yes
+    number_sections: yes
+    theme: united
+    toc: yes
+    toc_float:
+      collapsed: yes
+      smooth_scroll: yes
+  pdf_document:
+    toc: yes
+  word_document:
+    toc: yes
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Analysis of Lamy-Besnier et al. 2026: *in vitro* modeling of the intestinal microbiota predicts individualized probiotic response in metabolic syndrome.
+
+See https://github.com/QLamyBesnier/Probiotics_MBRA_2026 for more information.
+
+# Set-up
+
+## Packages
+
+Load the required packages:
+
+```{r Packages, message=FALSE, warning=FALSE}
+library(ggplot2)
+library(ggtext)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggpubr)
+library(vegan)
+library(cowplot)
+library(tibble)
+library(maaslin3)
+library(lme4)
+library(lmerTest)
+library(randomForest)
+library(ROCR)
+```
+
+## Data preparation
+
+Load the necessary data:
+
+```{r Data, message=FALSE, warning=FALSE}
+# donors data
+donors <- read.csv("Donors_MBRA_Probiotic.csv", sep = ";", dec = ".", header = TRUE)
+
+# TLR data
+tlr4 <- read.table("TLR4_MBRA_Probiotic.csv", header = TRUE, sep = ";")
+tlr5 <- read.table("TLR5_MBRA_Probiotic.csv", header = TRUE, sep = ";")
+
+# 16S qPCR data
+qPCR_16S <- read.csv("16S_qPCR_MBRA_Probiotics.csv", header = TRUE, sep = ";")
+
+# Probiotic strains qPCR data
+Banimalis <- read.csv("B_animalis_MBRA_Probiotic.csv", header = TRUE, sep = ";")
+Lplantarum <- read.csv("L_plantarum_MBRA_Probiotic.csv", header = TRUE, sep = ";")
+Lreuteri <- read.csv("L_reuteri_MBRA_Probiotic.csv", header = TRUE, sep = ";")
+
+# Bray-Curtis data
+bc <- read.csv("BC_norm3_MBRA_Probiotic.csv", sep = ";", header = TRUE, check.names = FALSE)
+# Distance matrix
+distance_matrix <- read.delim(file ="Distance_matrix_MBRA_Probiotic.tsv", header = TRUE)
+# Shannon data (normalized)
+shannon <- read.csv("Shannon_norm3_MBRA_Probiotic.csv", sep = ",", header = TRUE, check.names = FALSE)
+# Shannon data (raw)
+shannon_raw <- read.delim("Shannon_raw_MBRA_Probiotic.tsv", header = TRUE, dec = ".")
+
+# Metadata
+metadata <- read.delim(file = "/pasteur/helix/projects/Analyse_MHI_Zeus/Quentin_ZEUS/MBRA_Protobiotics/16S/Illumina_65/Script_split_20_180/Data/sample-metadata.txt", header = TRUE)
+
+# Data for Maaslin
+input_maaslin <- read.csv("Genus_relab_MBRA_Probiotic.csv", header = TRUE, sep = ",", dec = ".")
+metadata_maaslin <- read.csv("Metadata_Maaslin_MBRA_Probiotic.csv", header = TRUE, sep = ",", dec = ".")
+
+# multivariate data
+multivariate_D10_all <- read.csv("Multivariate_T10_MBRA_Probiotic.csv", header = TRUE, sep = ";")
+
+# ROC data
+multivariate_D10_ROC_probiotics <- read.csv("ROC_T10_Probiotics_MBRA_Probiotic.csv", header = TRUE, sep = ";")
+multivariate_D10_ROC_control <- read.csv("ROC_T10_Control_MBRA_Probiotic.csv", header = TRUE, sep = ";")
+```
+
+Prepare the TLR4/TLR5 data:
+
+```{r Data prep TLR4 TLR5, message=FALSE, warning=FALSE}
+tlr4_clean <- tlr4 %>% mutate(LPS = case_when(Donor == 7017 ~ Dil1,
+                                              Dil4 == 0 ~ Dil3,
+                                              TRUE ~ Dil4))
+
+tlr5_clean <- tlr5 %>% mutate(Flagellin = if_else(Dil2 == 0, Dil3, Dil2))
+
+# adapt the timepoints so that they show up in good order for the graph
+tlr4_clean <- tlr4_clean %>% 
+  mutate(Timepoint = str_replace(as.character(Timepoint), "^T", "")) %>%
+  mutate(Timepoint = factor(Timepoint, levels = c("0", "3", "4", "5", "7", "9", "10", "12")))
+tlr5_clean <- tlr5_clean %>% 
+  mutate(Timepoint = str_replace(as.character(Timepoint), "^T", "")) %>%
+  mutate(Timepoint = factor(Timepoint, levels = c("0", "3", "4", "5", "7", "9", "10", "12")))
+
+# add a "donor x responder" variable so that we can facet with responder/non responders
+tlr4_clean <- tlr4_clean %>% mutate(Responder_Donor = paste(Responder, Donor, sep = "_"))
+tlr4_clean$Responder_Donor <- factor(tlr4_clean$Responder_Donor, levels = sort(unique(tlr4_clean$Responder_Donor)))
+tlr5_clean <- tlr5_clean %>% mutate(Responder_Donor = paste(Responder, Donor, sep = "_"))
+tlr5_clean$Responder_Donor <- factor(tlr5_clean$Responder_Donor, levels = sort(unique(tlr5_clean$Responder_Donor)))
+
+# average of control LPS values per timepoint and donor
+average_control_tlr4 <- tlr4_clean %>%
+  filter(Group == "Control") %>%
+  group_by(Timepoint, Donor) %>%
+  summarise(avg_lps = mean(LPS))
+
+# normalization of all values by their corresponding average control LPS value per timepoint and donor
+tlr4_norm_ctrl <- tlr4_clean %>%
+  left_join(average_control_tlr4, by = c("Timepoint", "Donor")) %>%
+  mutate(Normalized_LPS = LPS / avg_lps) %>%
+  select(-avg_lps)
+
+# average of T3 values for each group and donor
+t3_average_lps <- tlr4_norm_ctrl  %>%
+  filter(Timepoint == "3") %>%
+  group_by(Donor, Group) %>%
+  summarise(t3_avg_lps = mean(Normalized_LPS))
+
+# compute average and SE of raw values
+tlr4_avg <- tlr4_clean %>%
+  mutate(Donor = as.factor(Donor)) %>%
+  group_by(Donor, Timepoint, Responder, Group) %>%
+  summarise(Average_LPS = mean(LPS, na.rm = TRUE),
+            SE_LPS = sd(LPS, na.rm = TRUE) / sqrt(n())) %>%
+  mutate(Donor_Group = interaction(Donor, Group, sep = "*"))
+
+# normalization of all values 
+tlr4_norm_ctrl_t3 <- tlr4_norm_ctrl %>%
+  left_join(t3_average_lps, by = c("Donor", "Group")) %>%
+  mutate(Double_Normalized_LPS = Normalized_LPS / t3_avg_lps) %>%
+  select(-t3_avg_lps)
+
+# only keep the probiotics data at T3 and later
+tlr4_norm_ctrl_t3_probiotics <- tlr4_norm_ctrl_t3 %>%
+  filter(Group == "Probiotics" & Timepoint != "0" & Donor != "7017")
+
+# compute the average per donor
+tlr4_norm_ctrl_t3_probiotics_avg <- tlr4_norm_ctrl_t3_probiotics %>%
+  group_by(Donor, Timepoint, Responder) %>%
+  summarise(Average_LPS = mean(Double_Normalized_LPS, na.rm = TRUE),
+            SE_LPS = sd(Double_Normalized_LPS, na.rm = TRUE) / sqrt(n()))
+
+# compute the average/SE for responders and non-responders
+tlr4_norm_ctrl_t3_probiotics_avg_responders <- tlr4_norm_ctrl_t3_probiotics_avg %>%
+  group_by(Timepoint, Responder) %>%
+  summarise(avg_resp_FC = mean(Average_LPS, na.rm = TRUE),
+            avg_resp_SE_FC = sd(Average_LPS, na.rm = TRUE) / sqrt(n()),
+            .groups = 'drop')
+
+# compute average and SE of raw values
+tlr5_avg <- tlr5_clean %>%
+  mutate(Donor = as.factor(Donor)) %>%
+  group_by(Donor, Timepoint, Responder, Group) %>%
+  summarise(Average_Flagellin = mean(Flagellin, na.rm = TRUE),
+            SE_Flagellin = sd(Flagellin, na.rm = TRUE) / sqrt(n())) %>%
+  mutate(Donor_Group = interaction(Donor, Group, sep = "*"))
+
+# average of control Flagellin values per timepoint and donor
+average_control_tlr5 <- tlr5_clean %>%
+  filter(Group == "Control") %>%
+  group_by(Timepoint, Donor) %>%
+  summarise(avg_flagellin = mean(Flagellin))
+
+# normalization of all values by their corresponding average control Flagellin value per timepoint and donor
+tlr5_norm_ctrl <- tlr5_clean %>%
+  left_join(average_control_tlr5, by = c("Timepoint", "Donor")) %>%
+  mutate(Normalized_Flagellin = Flagellin / avg_flagellin) %>%
+  select(-avg_flagellin)
+
+# average of T3 values for each group and donor
+t3_average_flagellin <- tlr5_norm_ctrl  %>%
+  filter(Timepoint == "3") %>%
+  group_by(Donor, Group) %>%
+  summarise(t3_avg_flagellin = mean(Normalized_Flagellin))
+
+# normalization of all values 
+tlr5_norm_ctrl_t3 <- tlr5_norm_ctrl %>%
+  left_join(t3_average_flagellin, by = c("Donor", "Group")) %>%
+  mutate(Double_Normalized_Flagellin = Normalized_Flagellin / t3_avg_flagellin) %>%
+  select(-t3_avg_flagellin)
+
+# only keep the probiotics data at T3 and later
+tlr5_norm_ctrl_t3_probiotics <- tlr5_norm_ctrl_t3 %>%
+  filter(Group == "Probiotics" & Timepoint != "0" & Donor != "7017")
+
+# compute the average per donor
+tlr5_norm_ctrl_t3_probiotics_avg <- tlr5_norm_ctrl_t3_probiotics %>%
+  group_by(Donor, Timepoint, Responder) %>%
+  summarise(Average_Flagellin = mean(Double_Normalized_Flagellin, na.rm = TRUE),
+            SE_Flagellin = sd(Double_Normalized_Flagellin, na.rm = TRUE) / sqrt(n()))
+
+# compute the average/SE for responders and non-responders
+tlr5_norm_ctrl_t3_probiotics_avg_responders <- tlr5_norm_ctrl_t3_probiotics_avg %>%
+  group_by(Timepoint, Responder) %>%
+  summarise(avg_resp_FC = mean(Average_Flagellin, na.rm = TRUE),
+            avg_resp_SE_FC = sd(Average_Flagellin, na.rm = TRUE) / sqrt(n()),
+            .groups = 'drop')
+```
+
+Prepare the 16S qPCR data:
+
+```{r Data prep 16S qPCR, message=FALSE, warning=FALSE}
+# average of all chambers (control and probiotics) at T3, which is our pseudo-ΔCt
+ΔCt <- qPCR_16S %>% 
+  filter(Timepoint == "T3") %>% 
+  summarize(average_Cq_Final = mean(Cq_Final, na.rm = TRUE)) %>% 
+  pull(average_Cq_Final)
+
+# comparison of all values to ΔCt (value - ΔCt)
+qPCR_16S <- qPCR_16S %>% 
+  mutate(ΔΔCt = Cq_Final-ΔCt)
+
+# fold-change calculation (2^-ΔΔCt)
+qPCR_16S <- qPCR_16S %>% 
+  mutate(FC = 2^-ΔΔCt)
+
+qPCR_16S <- qPCR_16S %>%
+  mutate(Timepoint = str_replace(as.character(Timepoint), "^T", "")) %>%
+  mutate(Timepoint = factor(Timepoint, levels = c("0", "3", "4", "5", "7", "9", "10", "12")))
+
+# compute average and SE
+qPCR_16S_avg <- qPCR_16S %>%
+  mutate(Donor = as.factor(Donor)) %>%
+  group_by(Donor, Timepoint, Responder, Group) %>%
+  summarise(Average_FC = mean(FC, na.rm = TRUE),
+            SE_FC = sd(FC, na.rm = TRUE) / sqrt(n())) %>%
+  mutate(Donor_Group = interaction(Donor, Group, sep = "*"))
+
+# divide FC values for Probiotics by average of FC values for control
+qPCR_16S_norm <- qPCR_16S %>%
+  group_by(Donor, Timepoint) %>%
+  mutate(Control_avg_FC = mean(FC[Group == "Control"])) %>%
+  mutate(Norm_FC = FC / Control_avg_FC) %>%
+  ungroup() %>%
+  select(-Control_avg_FC)
+  
+# compute average and SE
+qPCR_16S_norm_avg <- qPCR_16S_norm %>%
+  group_by(Donor, Timepoint, Responder, Group) %>%
+  summarise(Average_Norm_FC = mean(Norm_FC, na.rm = TRUE),
+            SE_Norm_FC = sd(Norm_FC, na.rm = TRUE) / sqrt(n()))
+
+# average of T3 values for each group and donor
+t3_average_qPCR_16S <- qPCR_16S_norm  %>%
+  filter(Timepoint == "3") %>%
+  group_by(Donor, Group) %>%
+  summarise(t3_avg_qPCR_16S = mean(Norm_FC))
+
+# normalization of all values 
+qPCR_16S_norm_ctrl_t3 <- qPCR_16S_norm %>%
+  left_join(t3_average_qPCR_16S, by = c("Donor", "Group")) %>%
+  mutate(Double_Normalized_FC = Norm_FC / t3_avg_qPCR_16S) %>%
+  select(-t3_avg_qPCR_16S)
+
+# compute average and SE
+qPCR_16S_norm_ctrl_t3_avg <- qPCR_16S_norm_ctrl_t3 %>%
+  group_by(Donor, Timepoint, Responder, Group) %>%
+  summarise(Average_Norm_ctrl_t3_FC = mean(Double_Normalized_FC, na.rm = TRUE),
+            SE_Norm_ctrl_t3_FC = sd(Double_Normalized_FC, na.rm = TRUE) / sqrt(n()))
+
+# compute the average/SE for responders and non-responders
+qPCR_16S_norm_ctrl_t3_avg_responders <- qPCR_16S_norm_ctrl_t3_avg %>%
+  group_by(Timepoint, Responder, Group) %>%
+  summarise(avg_resp_FC = mean(Average_Norm_ctrl_t3_FC, na.rm = TRUE),
+            avg_resp_SE_FC = sd(Average_Norm_ctrl_t3_FC, na.rm = TRUE) / sqrt(n()),
+            .groups = 'drop')
+```
+
+Prepare the B. animalis qPCR data:
+
+```{r B_animalis_prep, message=FALSE, warning=FALSE}
+# replace values ≥ 35 by NA's
+Banimalis_clean <- Banimalis %>% mutate(Cq = if_else(Cq >= 35, NA_real_, Cq))
+
+# when a triplicate has 2 NA's, set the 3rd value as NA as well
+Banimalis_clean <- Banimalis_clean %>%
+  group_by(Donor, Group, Timepoint) %>%
+  mutate(na_count = sum(is.na(Cq))) %>%
+  mutate(Cq = if_else(na_count >= 2, NA_real_, Cq)) %>%
+  select(-na_count) %>%
+  ungroup()
+
+# average of all chambers (probiotics) at T4, which is our pseudo-ΔCt
+Banimalis_ΔCt <- Banimalis_clean %>% 
+  filter(Timepoint == "T4", Group == "Probiotics") %>% 
+  summarize(average_Cq = mean(Cq, na.rm = TRUE)) %>% 
+  pull(average_Cq)
+
+# comparison of all values to ΔCt (value - ΔCt)
+Banimalis_clean <- Banimalis_clean %>% 
+  mutate(ΔΔCt = Cq-Banimalis_ΔCt)
+
+# fold-change calculation (2^-ΔΔCt)
+Banimalis_clean <- Banimalis_clean %>% 
+  mutate(FC = 2^-ΔΔCt)
+
+# adapt the timepoints to days and so that they show up in good order for the graph
+Banimalis_clean <- Banimalis_clean %>% 
+  mutate(Timepoint = str_replace(as.character(Timepoint), "^T", "")) %>%
+  mutate(Timepoint = factor(Timepoint, levels = c("0", "3", "4", "5", "7", "9", "10", "12")))
+
+# compute average and SE, for both the raw and FC values
+Banimalis_clean_avg <- Banimalis_clean %>%
+  group_by(Donor, Timepoint, Responder, Group) %>%
+  summarise(Average_Raw = mean(Cq, na.rm = TRUE),
+            SE_Raw = sd(Cq, na.rm = TRUE) / sqrt(n()),
+            Average_FC = mean(FC, na.rm = TRUE),
+            SE_FC = sd(FC, na.rm = TRUE) / sqrt(n()))
+
+# replace the missings values with 35, our limit of detection
+Banimalis_clean_avg <- Banimalis_clean_avg %>% mutate(Average_Raw = replace_na(Average_Raw, 35))
+
+# create a variable for grouping per donor + group
+Banimalis_clean_avg <- Banimalis_clean_avg %>%
+  mutate(Donor_Group = paste(Donor, Group, sep = "_"))
+
+# average and SE per group (Control/Probiotics)
+Banimalis_clean_avg_group <- Banimalis_clean_avg %>%
+  group_by(Group, Timepoint) %>%
+  summarize(Average_Group = mean(Average_Raw, na.rm = TRUE),
+    SE_Group = sd(Average_Raw, na.rm = TRUE) / sqrt(n()))
+
+# compute the average/SE for responders and non-responders, for both raw and FC values
+Banimalis_clean_avg_responders <- Banimalis_clean_avg %>%
+  group_by(Timepoint, Responder, Group) %>%
+  summarise(avg_resp_FC = mean(Average_FC, na.rm = TRUE),
+            avg_resp_SE_FC = sd(Average_FC, na.rm = TRUE) / sqrt(n()),
+            avg_resp_Raw = mean(Average_Raw, na.rm = TRUE),
+            avg_resp_SE_Raw = sd(Average_Raw, na.rm = TRUE) / sqrt(n()),
+            .groups = 'drop')
+```
+
+Prepare the L. plantarum qPCR data:
+
+```{r L_plantarum_prep, message=FALSE, warning=FALSE}
+# replace values ≥ 35 by NA's
+Lplantarum_clean <- Lplantarum %>% mutate(Cq = if_else(Cq >= 35, NA_real_, Cq))
+
+# when a triplicate has 2 NA's, set the 3rd value as NA as well
+Lplantarum_clean <- Lplantarum_clean %>%
+  group_by(Donor, Group, Timepoint) %>%
+  mutate(na_count = sum(is.na(Cq))) %>%
+  mutate(Cq = if_else(na_count >= 2, NA_real_, Cq)) %>%
+  select(-na_count) %>%
+  ungroup()
+
+# average of all chambers (probiotics) at T4, which is our pseudo-ΔCt
+Lplantarum_ΔCt <- Lplantarum_clean %>% 
+  filter(Timepoint == "T4", Group == "Probiotics") %>% 
+  summarize(average_Cq = mean(Cq, na.rm = TRUE)) %>% 
+  pull(average_Cq)
+
+# comparison of all values to ΔCt (value - ΔCt)
+Lplantarum_clean <- Lplantarum_clean %>% 
+  mutate(ΔΔCt = Cq-Lplantarum_ΔCt)
+
+# fold-change calculation (2^-ΔΔCt)
+Lplantarum_clean <- Lplantarum_clean %>% 
+  mutate(FC = 2^-ΔΔCt)
+
+# adapt the timepoints to days and so that they show up in good order for the graph
+Lplantarum_clean <- Lplantarum_clean %>%
+  mutate(Timepoint = str_replace(as.character(Timepoint), "^T", "")) %>%
+  mutate(Timepoint = factor(Timepoint, levels = c("0", "3", "4", "5", "7", "9", "10", "12")))
+
+# compute average and SE, for both the raw and FC values
+Lplantarum_clean_avg <- Lplantarum_clean %>%
+  group_by(Donor, Timepoint, Responder, Group) %>%
+  summarise(Average_Raw = mean(Cq, na.rm = TRUE),
+            SE_Raw = sd(Cq, na.rm = TRUE) / sqrt(n()),
+            Average_FC = mean(FC, na.rm = TRUE),
+            SE_FC = sd(FC, na.rm = TRUE) / sqrt(n()))
+
+# replace the missings values with 35, our limit of detection
+Lplantarum_clean_avg <- Lplantarum_clean_avg %>% mutate(Average_Raw = replace_na(Average_Raw, 35))
+
+# create a variable for grouping per donor + group
+Lplantarum_clean_avg <- Lplantarum_clean_avg %>%
+  mutate(Donor_Group = paste(Donor, Group, sep = "_"))
+
+# average and SE per group (Control/Probiotics)
+Lplantarum_clean_avg_group <- Lplantarum_clean_avg %>%
+  group_by(Group, Timepoint) %>%
+  summarize(Average_Group = mean(Average_Raw, na.rm = TRUE),
+    SE_Group = sd(Average_Raw, na.rm = TRUE) / sqrt(n()))
+
+# compute the average/SE for responders and non-responders, for both raw and FC values
+Lplantarum_clean_avg_responders <- Lplantarum_clean_avg %>%
+  group_by(Timepoint, Responder, Group) %>%
+  summarise(avg_resp_FC = mean(Average_FC, na.rm = TRUE),
+            avg_resp_SE_FC = sd(Average_FC, na.rm = TRUE) / sqrt(n()),
+            avg_resp_Raw = mean(Average_Raw, na.rm = TRUE),
+            avg_resp_SE_Raw = sd(Average_Raw, na.rm = TRUE) / sqrt(n()),
+            .groups = 'drop')
+```
+
+Prepare the L. reuteri qPCR data
+
+```{r L_reuteri_prep, message=FALSE, warning=FALSE}
+# replace values ≥ 35 by NA's
+Lreuteri_clean <- Lreuteri %>% mutate(Cq = if_else(Cq >= 35, NA_real_, Cq))
+
+# when a triplicate has 2 NA's, set the 3rd value as NA as well
+Lreuteri_clean <- Lreuteri_clean %>%
+  group_by(Donor, Group, Timepoint) %>%
+  mutate(na_count = sum(is.na(Cq))) %>%
+  mutate(Cq = if_else(na_count >= 2, NA_real_, Cq)) %>%
+  select(-na_count) %>%
+  ungroup()
+
+# average of all chambers (probiotics) at T4, which is our pseudo-ΔCt
+Lreuteri_ΔCt <- Lreuteri_clean %>% 
+  filter(Timepoint == "T4", Group == "Probiotics") %>% 
+  summarize(average_Cq = mean(Cq, na.rm = TRUE)) %>% 
+  pull(average_Cq)
+
+# comparison of all values to ΔCt (value - ΔCt)
+Lreuteri_clean <- Lreuteri_clean %>% 
+  mutate(ΔΔCt = Cq-Lreuteri_ΔCt)
+
+# fold-change calculation (2^-ΔΔCt)
+Lreuteri_clean <- Lreuteri_clean %>% 
+  mutate(FC = 2^-ΔΔCt)
+
+# adapt the timepoints to days and so that they show up in good order for the graph
+Lreuteri_clean <- Lreuteri_clean %>% 
+  mutate(Timepoint = str_replace(as.character(Timepoint), "^T", "")) %>%
+  mutate(Timepoint = factor(Timepoint, levels = c("0", "3", "4", "5", "7", "9", "10", "12")))
+
+# compute average and SE, for both the raw and FC values
+Lreuteri_clean_avg <- Lreuteri_clean %>%
+  group_by(Donor, Timepoint, Responder, Group) %>%
+  summarise(Average_Raw = mean(Cq, na.rm = TRUE),
+            SE_Raw = sd(Cq, na.rm = TRUE) / sqrt(n()),
+            Average_FC = mean(FC, na.rm = TRUE),
+            SE_FC = sd(FC, na.rm = TRUE) / sqrt(n()))
+
+# replace the missings values with 35, our limit of detection
+Lreuteri_clean_avg <- Lreuteri_clean_avg %>% mutate(Average_Raw = replace_na(Average_Raw, 35))
+
+# create a variable for grouping per donor + group
+Lreuteri_clean_avg <- Lreuteri_clean_avg %>%
+  mutate(Donor_Group = paste(Donor, Group, sep = "_"))
+
+# average and SE per group (Control/Probiotics)
+Lreuteri_clean_avg_group <- Lreuteri_clean_avg %>%
+  group_by(Group, Timepoint) %>%
+  summarize(Average_Group = mean(Average_Raw, na.rm = TRUE),
+    SE_Group = sd(Average_Raw, na.rm = TRUE) / sqrt(n()))
+
+# compute the average/SE for responders and non-responders, for both raw and FC values
+Lreuteri_clean_avg_responders <- Lreuteri_clean_avg %>%
+  group_by(Timepoint, Responder, Group) %>%
+  summarise(avg_resp_FC = mean(Average_FC, na.rm = TRUE),
+            avg_resp_SE_FC = sd(Average_FC, na.rm = TRUE) / sqrt(n()),
+            avg_resp_Raw = mean(Average_Raw, na.rm = TRUE),
+            avg_resp_SE_Raw = sd(Average_Raw, na.rm = TRUE) / sqrt(n()),
+            .groups = 'drop')
+```
+
+Prepare the 16S sequencing data:
+
+```{r Data prep 16S sequencing, message=FALSE, warning=FALSE}
+# only keep the probiotics samples
+bc_probio <- bc %>% filter(Label == "Probiotics")
+shannon_probio <- shannon %>% filter(Label == "Probiotics")
+
+# clean metadata
+metadata <- metadata[-1, ]
+metadata <- metadata %>% 
+  mutate(Timepoint = str_replace(as.character(Timepoint), "^T", "")) %>%
+  mutate(Timepoint = factor(Timepoint, levels = c("0", "3", "4", "5", "7", "9", "10", "12")))
+
+# transform data to long format
+shannon_probio_long <- shannon_probio %>%
+  pivot_longer(cols = starts_with("70"), names_to = "Variable", values_to = "Value")
+
+# add responder/non-responder status
+shannon_probio_long <- shannon_probio_long %>%
+  mutate(Responder = case_when(Variable %in% c("7005", "7017", "7015", "7023") ~ "R", TRUE ~ "NR"))
+
+# compute average per donor and timepoint
+shannon_probio_mean <- shannon_probio_long %>%
+  group_by(Time, Variable, Responder) %>%
+  summarize(Mean = mean(Value, na.rm = TRUE),
+            SE = sd(Value, na.rm = TRUE) / sqrt(n()))
+
+# transform data to long format
+bc_probio_long <- bc_probio %>%
+  pivot_longer(cols = starts_with("70"), names_to = "Variable", values_to = "Value")
+
+# add responder/non-responder status
+bc_probio_long <- bc_probio_long %>%
+  mutate(Responder = case_when(Variable %in% c("7005", "7017", "7015", "7023") ~ "R", TRUE ~ "NR"))
+
+# compute average per donor and timepoint
+bc_probio_mean <- bc_probio_long %>%
+  group_by(Time, Variable, Responder) %>%
+  summarize(Mean = mean(Value, na.rm = TRUE),
+            SE = sd(Value, na.rm = TRUE) / sqrt(n()))
+
+# remove t3
+bc_probio_mean_t3 <- bc_probio_mean %>% filter(Time != "0")
+shannon_probio_mean_t3 <- shannon_probio_mean %>% filter(Time != "0")
+
+# compute the average/SE for responders and non-responders
+bc_probio_mean_t3_responders <- bc_probio_mean_t3 %>%
+  group_by(Time, Responder) %>%
+  summarise(avg_resp = mean(Mean, na.rm = TRUE),
+            avg_resp_SE = sd(Mean, na.rm = TRUE) / sqrt(n()),
+            .groups = 'drop')
+shannon_probio_mean_t3_responders <- shannon_probio_mean_t3 %>%
+  group_by(Time, Responder) %>%
+  summarise(avg_resp = mean(Mean, na.rm = TRUE),
+            avg_resp_SE = sd(Mean, na.rm = TRUE) / sqrt(n()),
+            .groups = 'drop')
+
+# for the raw shannon data, combine data and metadata
+shannon_raw_meta <- shannon_raw %>%
+  rename(sample.id = X, Shannon = shannon_entropy) %>%
+  left_join(metadata %>% select(sample.id, Timepoint, Group, Donor, Donor_Responder), by = "sample.id") %>%
+  rename(Responder = Donor_Responder) %>%
+  mutate(Donor = str_replace(Donor, "^Donor_", ""))
+
+# compute average and SE
+shannon_raw_mean <- shannon_raw_meta %>%
+  mutate(Donor = as.factor(Donor)) %>%
+  group_by(Donor, Timepoint, Responder, Group) %>%
+  summarise(Average_Shannon = mean(Shannon, na.rm = TRUE),
+            SE_Shannon = sd(Shannon, na.rm = TRUE) / sqrt(n())) %>%
+  mutate(Donor_Group = interaction(Donor, Group, sep = "*"))
+```
+
+Prepare the overall distance matrix for PCoA:
+
+```{r Data prep PCoA, message=FALSE, warning=FALSE}
+# reformat distance matrix
+distance_matrix_clean <- distance_matrix
+rownames(distance_matrix_clean) <- distance_matrix_clean$X
+distance_matrix_clean <- distance_matrix_clean[, -1]
+
+# PCoA
+pcoa_full <- cmdscale(as.dist(distance_matrix_clean), k = 2, eig = TRUE)
+# PCoA coordinates
+pcoa_full_df <- data.frame(Sample = rownames(pcoa_full$points),
+                      PC1 = pcoa_full$points[, 1],
+                      PC2 = pcoa_full$points[, 2])
+
+# add metadata
+pcoa_full_meta <- merge(pcoa_full_df, metadata, by.x = "Sample", by.y = "sample.id")
+
+# variance explained
+pcoa_full_variance <- 100 * (pcoa_full$eig / sum(pcoa_full$eig))
+pc1_full_all <- round(pcoa_full_variance[1], 2)
+pc2_full_all <- round(pcoa_full_variance[2], 2)
+```
+
+Prepare the Maaslin data:
+
+```{r Data prep Maaslin, message=FALSE, warning=FALSE}
+# format the input data (family en rownames)
+rownames(input_maaslin) <- input_maaslin$index
+input_maaslin <- input_maaslin %>% select(-index)
+
+# format the input metadata
+rownames(metadata_maaslin) <- metadata_maaslin$index
+metadata_maaslin$index <- NULL
+metadata_maaslin <- metadata_maaslin %>% rename(Responder = Donor_Responder)
+
+# set variables with more than 2 values as factor for maaslin3
+metadata_maaslin$Timepoint <- factor(metadata_maaslin$Timepoint)
+metadata_maaslin$Donor <- factor(metadata_maaslin$Donor)
+```
+
+Prepare the multivariate data:
+
+```{r Data prep multivariate data, message=FALSE, warning=FALSE}
+# remove the metadata, only keep what's relevant for building the distance matrix
+multivariate_D10_all_clean <- multivariate_D10_all
+multivariate_D10_all_clean <- multivariate_D10_all %>% select(-Sample, -Group, -Responder, -Donor)
+rownames(multivariate_D10_all_clean) <- multivariate_D10_all$Sample
+
+# replace NA's by 0
+multivariate_D10_all_clean[is.na(multivariate_D10_all_clean)] <- 0
+
+# create associated metadata
+metadata_multivariate <- multivariate_D10_all %>% select(Sample, Donor, Group, Responder)
+```
+
+Prepare the ROC data:
+
+```{r Data prep ROC, message=FALSE, warning=FALSE}
+# remove the 3 probiotics from the analysis
+multivariate_D10_ROC_probiotics_clean <- multivariate_D10_ROC_probiotics %>% select(-L_Reuteri, -L_Plantarum, -B_Animalis)
+multivariate_D10_ROC_control_clean <- multivariate_D10_ROC_control %>% select(-L_Reuteri, -L_Plantarum, -B_Animalis)
+
+# replace NA's by 0
+multivariate_D10_ROC_probiotics_clean[is.na(multivariate_D10_ROC_probiotics_clean)] <- 0
+multivariate_D10_ROC_control_clean[is.na(multivariate_D10_ROC_control_clean)] <- 0
+
+# set up the order of groups to test
+multivariate_D10_ROC_control_clean$outcome <- factor(as.character(multivariate_D10_ROC_control_clean$outcome), levels = c("R", "NR"))
+multivariate_D10_ROC_probiotics_clean$outcome <- factor(as.character(multivariate_D10_ROC_probiotics_clean$outcome), levels = c("R", "NR"))
+```
+
+Prepare the ROC parameters:
+
+```{r ROC Parameters, message=FALSE, warning=FALSE}
+# store the different outcomes
+classes <- levels(multivariate_D10_ROC_control_clean$outcome)
+
+# seed for reproducibility
+set.seed(123)
+
+# wanted percentage in validation cohort
+pct_val <- 30
+a <- round(pct_val * nrow(multivariate_D10_ROC_control_clean) / 100)
+
+# nb of rep for mean ± SD
+B <- 100      
+# X
+ntree <- 100
+
+# common grid of FPR for mean/SD
+fpr_grid <- seq(0, 1, length.out = 201)
+
+# Interpolated TPR storage: one matrix per class (length(fpr_grid) x B)
+tpr_mat_list <- lapply(classes, function(x) matrix(NA_real_, nrow = length(fpr_grid), ncol = B))
+names(tpr_mat_list) <- classes
+
+# AUC storage by class and by repetition
+auc_mat <- matrix(NA_real_, nrow = length(classes), ncol = B,
+                  dimnames = list(classes, paste0("rep", 1:B)))
+```
+
+# Donors data
+
+Pairwise comparison of the metabolic markers fold-change between reponders and non-responders. This recreates Fig. S1:
+
+```{r Donors_FC, message=FALSE, warning=FALSE}
+# separate each timepoint
+donor_baseline <- subset(donors, Timepoint == "Baseline")
+donor_endpoint <- subset(donors, Timepoint == "Endpoint")
+
+# compute the log2FC
+donor_FC <- data.frame(Participant = donor_baseline$Participant, Responder = donor_baseline$Responder)
+for (variable in names(donor_baseline)[-c(1:3)]) {
+  FC <- donor_endpoint[[variable]] / donor_baseline[[variable]]
+  log2FC <- ifelse(!is.na(FC), log2(FC), NA)
+  donor_FC[[variable]] <- log2FC}
+
+# prepare for plotting
+donor_FC_long <- pivot_longer(donor_FC, cols = -c(Participant, Responder), names_to = "Variable", values_to = "log2FC")
+
+# graph
+ggplot(donor_FC_long %>% filter(Variable != "Height"), aes(x = Responder, y = log2FC, color = Responder)) +
+  geom_boxplot(width = 0.45, outlier.shape = NA) +
+  geom_jitter(width = 0.2, size = 1.5) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  scale_y_continuous(expand = expansion(mult = 0.15)) +
+  stat_compare_means(comparisons = list(c("R", "NR")), method = "wilcox.test", label = "p.format") +
+  facet_wrap(~ Variable, scales = "free", ncol = 3, labeller = labeller(Variable = function(string) {
+  gsub("_", " ", string)})) +
+  labs(title = "", x = "", y = "Log2(Endpoint/Baseline)", color = NULL) +
+  scale_color_manual(values = c("NR" = "#800080", "R" = "#008000"), labels = c("NR" = "Non-Responder", "R" = "Responder"))  +
+  #scale_x_discrete(labels = c("R" = "Responder", "NR" = "Non-Responder")) +
+  theme_minimal() +
+  theme(text = element_text(size = 20), axis.text = element_text(color = "black"), strip.text = element_text(size = 18, face = "bold"), legend.position = "none")
+
+ggsave("FigS1.pdf", device = "pdf", height = 11, width = 13, dpi = 300)
+```
+
+# Experiments
+
+## B. animalis qPCR
+
+Abundance of B. animalis over time, per donor (raw Cq). This recreates Fig. S2A:
+
+```{r B. animalis qPCR per donor, message=FALSE, warning=FALSE}
+Banimalis_clean_avg$Donor <- factor(Banimalis_clean_avg$Donor, 
+                              levels = c("7038", "7014", "7019", "7024", "7017", "7005", "7015", "7023"),
+                              labels = c("7038 (NR)", "7014 (NR)", "7019 (NR)", "7024 (NR)", "7017 (R)", "7005 (R)", "7015 (R)", "7023 (R)"))
+
+ggplot(Banimalis_clean_avg, aes(x = Timepoint, y = Average_Raw, color = Group, group = Group)) +
+  geom_line(size = 0.8) +
+  geom_point(size = 2) +
+  geom_errorbar(aes(ymin = Average_Raw - SE_Raw, ymax = Average_Raw + SE_Raw), width = 0.1) +
+  labs(title = "",
+       x = "Day",
+       y = "*B. animalis* (Cq)",
+       color = NULL) +
+  scale_color_manual(values = c("Probiotics" = "#56B4E9", "Control" = "#E69F00")) +
+  theme_minimal() +
+  scale_y_reverse() + 
+  coord_cartesian(ylim = c(36, 22)) +
+  theme(plot.title = element_text(hjust = 0.5), text = element_text(size = 20), axis.text = element_text(color = "black"), axis.title.y = element_markdown()) +
+  facet_wrap(~ Donor, nrow = 2) +
+  geom_hline(yintercept = 35, linetype = "dashed", color = "black") +
+  annotate("text", x = Inf, y = 34.2, label = "LOD", color = "black", hjust = 1.1, size = 4) +
+  annotate("rect", xmin = 2, xmax = 7, ymin = 0, ymax = Inf, fill = "grey",alpha = 0.3)
+
+ggsave("FigS2A.pdf", device = "pdf", height = 6, width = 12, dpi = 300)
+```
+
+Abundance of B. animalis over time (raw Cq). This recreates Fig. 2A:
+
+```{r B. animalis qPCR summary, message=FALSE, warning=FALSE}
+ggplot(Banimalis_clean_avg, aes(x = Timepoint, y = Average_Raw, color = Group, group = Donor_Group)) +
+  geom_line(size = 0.8) +
+  geom_point(size = 2) +
+  geom_errorbar(aes(ymin = Average_Raw - SE_Raw, ymax = Average_Raw + SE_Raw), width = 0.1) +
+  geom_line(data = Banimalis_clean_avg_group, aes(y = Average_Group, group = Group), size = 1, linetype = "dashed") +
+  geom_ribbon(data = Banimalis_clean_avg_group, aes(y = Average_Group, ymin = Average_Group - SE_Group, ymax = Average_Group + SE_Group, group = Group, fill = Group), alpha = 0.15, color = NA) +
+  labs(title = "",
+       x = "Day",
+       y = "*B. animalis* (Cq)",
+       color = NULL,
+       fill = NULL) +
+  scale_color_manual(values = c("Probiotics" = "#56B4E9", "Control" = "#E69F00")) +
+    scale_fill_manual(values = c("Probiotics" = "#56B4E9", "Control" = "#E69F00"))  +
+  theme_minimal() +
+  scale_y_reverse() + 
+  coord_cartesian(ylim = c(36, 22)) +
+  theme(plot.title = element_text(hjust = 0.5), text = element_text(size = 30), axis.text = element_text(color = "black"), axis.title.y = element_markdown()) +
+  geom_hline(yintercept = 35, linetype = "dashed", color = "black") +
+  annotate("text", x = Inf, y = 34.66, label = "LOD", color = "black", hjust = 1.1, size = 5) +
+  annotate("rect", xmin = 2, xmax = 7, ymin = 0, ymax = Inf, fill = "grey",alpha = 0.3)
+
+ggsave("Fig2A.pdf", device = "pdf", height = 6, width = 10, dpi = 300)
+```
+
+Normalized abundance of B. animalis over time. This recreates Fig. 2D:
+
+```{r B. animalis qPCR, message=FALSE, warning=FALSE}
+ggplot(Banimalis_clean_avg %>% filter(Group == "Probiotics") %>% filter(!Timepoint %in% c("0", "3")), aes(x = Timepoint, y = Average_FC, color = Responder, group = Donor)) +
+  # individual donor plotting
+  geom_line(size = 0.8) +
+  geom_point(size = 2) +
+  geom_errorbar(aes(ymin = Average_FC - SE_FC, ymax = Average_FC + SE_FC), width = 0.1) +
+  # average for R/NR plotting
+  geom_line(data = Banimalis_clean_avg_responders %>% filter(Group == "Probiotics") %>% filter(!Timepoint %in% c("0", "3")), aes(y = avg_resp_FC, group = Responder), size = 1, linetype = "dashed") +
+  geom_ribbon(data = Banimalis_clean_avg_responders %>% filter(Group == "Probiotics") %>% filter(!Timepoint %in% c("0", "3")), aes(y = avg_resp_FC, ymin = avg_resp_FC - avg_resp_SE_FC, ymax = avg_resp_FC + avg_resp_SE_FC, group = Responder, fill = Responder), alpha = 0.15, color = NA) +
+  # other parameters
+  labs(title = "",
+       x = "Day",
+       y = "*B. animalis* (Fold Change)",
+       color = NULL,
+       fill = NULL) +
+  scale_y_continuous(trans = "log2") +
+  geom_hline(yintercept = 1, color = "black", linetype = "dashed", linewidth = 0.5) +
+  scale_color_manual(values = c("NR" = "#800080", "R" = "#008000"), labels = c("NR" = "Non-Responder", "R" = "Responder"))  +
+  scale_fill_manual(values = c("NR" = "#800080", "R" = "#008000"), labels = c("NR" = "Non-Responder", "R" = "Responder"))  +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5), text = element_text(size = 30), axis.text = element_text(color = "black"), axis.title.y = ggtext::element_markdown())
+
+ggsave("Fig2D.pdf", device = "pdf", height = 6, width = 10, dpi = 300)
+```
+
+Statistical model to check for a difference between R/NR:
+
+```{r B. animalis qPCR model, message=FALSE, warning=FALSE}
+# model
+model_Banimalis <- lmer(log(FC) ~ Responder + (1 | Donor), data = Banimalis_clean %>% filter(Group == "Probiotics") %>% filter(!Timepoint %in% c("0", "3")))
+summary(model_Banimalis)
+```
+
+## L. plantarum qPCR
+
+Abundance of L. plantarum over time, per donor (raw Cq). This recreates Fig. S2B:
+
+```{r L. plantarum qPCR per donor, message=FALSE, warning=FALSE}
+Lplantarum_clean_avg$Donor <- factor(Lplantarum_clean_avg$Donor, 
+                              levels = c("7038", "7014", "7019", "7024", "7017", "7005", "7015", "7023"),
+                              labels = c("7038 (NR)", "7014 (NR)", "7019 (NR)", "7024 (NR)", "7017 (R)", "7005 (R)", "7015 (R)", "7023 (R)"))
+
+ggplot(Lplantarum_clean_avg, aes(x = Timepoint, y = Average_Raw, color = Group, group = Group)) +
+  geom_line(size = 0.8) +
+  geom_point(size = 2) +
+  geom_errorbar(aes(ymin = Average_Raw - SE_Raw, ymax = Average_Raw + SE_Raw), width = 0.1) +
+  labs(title = "",
+       x = "Day",
+       y = "*L. plantarum* (Cq)",
+       color = NULL) +
+  scale_color_manual(values = c("Probiotics" = "#56B4E9", "Control" = "#E69F00")) +
+  theme_minimal() +
+  scale_y_reverse() +
+  coord_cartesian(ylim = c(36, 22)) +
+  theme(plot.title = element_text(hjust = 0.5), text = element_text(size = 20), axis.text = element_text(color = "black"), axis.title.y = ggtext::element_markdown()) +
+  geom_hline(yintercept = 35, linetype = "dashed", color = "black") +
+  annotate("text", x = Inf, y = 34.2, label = "LOD", color = "black", hjust = 1.1, size = 5) +
+  annotate("rect", xmin = 2, xmax = 7, ymin = 0, ymax = Inf, fill = "grey",alpha = 0.3) +
+  facet_wrap(~ Donor, nrow = 2)
+
+ggsave("FigS2B.pdf", device = "pdf", height = 6, width = 12, dpi = 300)
+```
+
+Abundance of L. plantarum over time (raw Cq). This recreates Fig. 2B:
+
+```{r L. plantarum qPCR summary, message=FALSE, warning=FALSE}
+ggplot(Lplantarum_clean_avg, aes(x = Timepoint, y = Average_Raw, color = Group, group = Donor_Group)) +
+  geom_line(size = 0.8) +
+  geom_point(size = 2) +
+  geom_errorbar(aes(ymin = Average_Raw - SE_Raw, ymax = Average_Raw + SE_Raw), width = 0.1) +
+  geom_line(data = Lplantarum_clean_avg_group, aes(y = Average_Group, group = Group), size = 1, linetype = "dashed") +
+  geom_ribbon(data = Lplantarum_clean_avg_group, aes(y = Average_Group, ymin = Average_Group - SE_Group, ymax = Average_Group + SE_Group, group = Group, fill = Group), alpha = 0.15, color = NA) +
+  labs(title = "",
+       x = "Day",
+       y = "*L. plantarum* (Cq)",
+       color = NULL,
+       fill = NULL) +
+  scale_color_manual(values = c("Probiotics" = "#56B4E9", "Control" = "#E69F00")) +
+    scale_fill_manual(values = c("Probiotics" = "#56B4E9", "Control" = "#E69F00"))  +
+  theme_minimal() +
+  scale_y_reverse() + 
+  coord_cartesian(ylim = c(36, 22)) +
+  theme(plot.title = element_text(hjust = 0.5), text = element_text(size = 30), axis.text = element_text(color = "black"), axis.title.y = element_markdown()) +
+  geom_hline(yintercept = 35, linetype = "dashed", color = "black") +
+  annotate("text", x = Inf, y = 34.66, label = "LOD", color = "black", hjust = 1.1, size = 5) +
+  annotate("rect", xmin = 2, xmax = 7, ymin = 0, ymax = Inf, fill = "grey",alpha = 0.3)
+
+ggsave("Fig2B.pdf", device = "pdf", height = 6, width = 10, dpi = 300)
+```
+
+Normalized abundance of L. plantarum over time. This recreates Fig. 2E:
+
+```{r L. plantarum qPCR, message=FALSE, warning=FALSE}
+ggplot(Lplantarum_clean_avg %>% filter(Group == "Probiotics") %>% filter(!Timepoint %in% c("0", "3")), aes(x = Timepoint, y = Average_FC, color = Responder, group = Donor)) +
+  geom_line(size = 0.8) +
+  geom_point(size = 2) +
+  geom_errorbar(aes(ymin = Average_FC - SE_FC, ymax = Average_FC + SE_FC), width = 0.1) +
+  geom_line(data = Lplantarum_clean_avg_responders %>% filter(Group == "Probiotics") %>% filter(!Timepoint %in% c("0", "3")), aes(y = avg_resp_FC, group = Responder), size = 1, linetype = "dashed") +
+  geom_ribbon(data = Lplantarum_clean_avg_responders %>% filter(Group == "Probiotics") %>% filter(!Timepoint %in% c("0", "3")), aes(y = avg_resp_FC, ymin = avg_resp_FC - avg_resp_SE_FC, ymax = avg_resp_FC + avg_resp_SE_FC, group = Responder, fill = Responder), alpha = 0.15, color = NA) +
+  labs(title = "",
+       x = "Day",
+       y = "*L. plantarum* (Fold Change)",
+       color = NULL,
+       fill = NULL) +
+  scale_y_continuous(trans = "log2") +
+  geom_hline(yintercept = 1, color = "black", linetype = "dashed", linewidth = 0.5) +
+  scale_color_manual(values = c("NR" = "#800080", "R" = "#008000"), labels = c("NR" = "Non-Responder", "R" = "Responder")) +
+  scale_fill_manual(values = c("NR" = "#800080", "R" = "#008000"), labels = c("NR" = "Non-Responder", "R" = "Responder")) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5), text = element_text(size = 30), axis.text = element_text(color = "black"), axis.title.y = ggtext::element_markdown())
+
+ggsave("Fig2E.pdf", device = "pdf", height = 6, width = 10, dpi = 300)
+```
+
+Statistical model to check for a difference between R/NR:
+
+```{r L. plantarum qPCR model, message=FALSE, warning=FALSE}
+# model
+model_Lplantarum <- lmer(log(FC) ~ Responder + (1 | Donor), data = Lplantarum_clean %>% filter(Group == "Probiotics") %>% filter(!Timepoint %in% c("0", "3")))
+summary(model_Lplantarum)
+```
+
+## L. reuteri qPCR
+
+Abundance of L. reuteri over time, per donor (raw Cq). This recreates Fig. S2C:
+
+```{r L. reuteri qPCR per donor, message=FALSE, warning=FALSE}
+Lreuteri_clean_avg$Donor <- factor(Lreuteri_clean_avg$Donor, 
+                              levels = c("7038", "7014", "7019", "7024", "7017", "7005", "7015", "7023"),
+                                labels = c("7038 (NR)", "7014 (NR)", "7019 (NR)", "7024 (NR)", "7017 (R)", "7005 (R)", "7015 (R)", "7023 (R)"))
+
+ggplot(Lreuteri_clean_avg, aes(x = Timepoint, y = Average_Raw, color = Group, group = Group)) +
+  geom_line(size = 0.8) +
+  geom_point(size = 2) +
+  geom_errorbar(aes(ymin = Average_Raw - SE_Raw, ymax = Average_Raw + SE_Raw), width = 0.1) +
+  labs(title = "",
+       x = "Day",
+       y = "*L. reuteri* (Cq)",
+       color = NULL) +
+  scale_color_manual(values = c("Probiotics" = "#56B4E9", "Control" = "#E69F00")) +
+  theme_minimal() +
+  scale_y_reverse() +
+  coord_cartesian(ylim = c(36, 22)) +
+  theme(plot.title = element_text(hjust = 0.5), text = element_text(size = 20), axis.text = element_text(color = "black"), axis.title.y = ggtext::element_markdown()) +
+  geom_hline(yintercept = 35, linetype = "dashed", color = "black") +
+  annotate("text", x = Inf, y = 34.2, label = "LOD", color = "black", hjust = 1.1, size = 5) +
+  annotate("rect", xmin = 2, xmax = 7, ymin = 0, ymax = Inf, fill = "grey",alpha = 0.3) +
+  facet_wrap(~ Donor, nrow = 2)
+
+ggsave("FigS2C.pdf", device = "pdf", height = 6, width = 12, dpi = 300)
+```
+
+Abundance of L. reuteri over time (raw Cq). This recreates Fig. 2C:
+
+```{r L. reuteri qPCR summary, message=FALSE, warning=FALSE}
+ggplot(Lreuteri_clean_avg, aes(x = Timepoint, y = Average_Raw, color = Group, group = Donor_Group)) +
+  geom_line(size = 0.8) +
+  geom_point(size = 2) +
+  geom_errorbar(aes(ymin = Average_Raw - SE_Raw, ymax = Average_Raw + SE_Raw), width = 0.1) +
+  geom_line(data = Lreuteri_clean_avg_group, aes(y = Average_Group, group = Group), size = 1, linetype = "dashed") +
+  geom_ribbon(data = Lreuteri_clean_avg_group, aes(y = Average_Group, ymin = Average_Group - SE_Group, ymax = Average_Group + SE_Group, group = Group, fill = Group), alpha = 0.15, color = NA) +
+  labs(title = "",
+       x = "Day",
+       y = "*L. reuteri* (Cq)",
+       color = NULL,
+       fill = NULL) +
+  scale_color_manual(values = c("Probiotics" = "#56B4E9", "Control" = "#E69F00")) +
+    scale_fill_manual(values = c("Probiotics" = "#56B4E9", "Control" = "#E69F00"))  +
+  theme_minimal() +
+  scale_y_reverse() + 
+  coord_cartesian(ylim = c(36, 22)) +
+  theme(plot.title = element_text(hjust = 0.5), text = element_text(size = 30), axis.text = element_text(color = "black"), axis.title.y = element_markdown()) +
+  geom_hline(yintercept = 35, linetype = "dashed", color = "black") +
+  annotate("text", x = Inf, y = 34.66, label = "LOD", color = "black", hjust = 1.1, size = 5) +
+  annotate("rect", xmin = 2, xmax = 7, ymin = 0, ymax = Inf, fill = "grey",alpha = 0.3)
+
+ggsave("Fig2C.pdf", device = "pdf", height = 6, width = 10, dpi = 300)
+```
+
+Normalized abundance of L. reuteri over time. This recreates Fig. 2F:
+
+```{r L. reuteri qPCR, message=FALSE, warning=FALSE}
+ggplot(Lreuteri_clean_avg %>% filter(Group == "Probiotics") %>% filter(!Timepoint %in% c("0", "3")), aes(x = Timepoint, y = Average_FC, color = Responder, group = Donor)) +
+  geom_line(size = 0.8) +
+  geom_point(size = 2) +
+  geom_errorbar(aes(ymin = Average_FC - SE_FC, ymax = Average_FC + SE_FC), width = 0.1) +
+  geom_line(data = Lreuteri_clean_avg_responders %>% filter(Group == "Probiotics") %>% filter(!Timepoint %in% c("0", "3")), aes(y = avg_resp_FC, group = Responder), size = 1, linetype = "dashed") +
+  geom_ribbon(data = Lreuteri_clean_avg_responders %>% filter(Group == "Probiotics") %>% filter(!Timepoint %in% c("0", "3")), aes(y = avg_resp_FC, ymin = avg_resp_FC - avg_resp_SE_FC, ymax = avg_resp_FC + avg_resp_SE_FC, group = Responder, fill = Responder), alpha = 0.15, color = NA) +
+  labs(title = "",
+       x = "Day",
+       y = "*L. reuteri* (Fold Change)",
+       color = NULL,
+       fill = NULL) +
+  scale_y_continuous(trans = "log2") +
+  geom_hline(yintercept = 1, color = "black", linetype = "dashed", linewidth = 0.5) +
+  scale_color_manual(values = c("NR" = "#800080", "R" = "#008000"), labels = c("NR" = "Non-Responder", "R" = "Responder")) +
+  scale_fill_manual(values = c("NR" = "#800080", "R" = "#008000"), labels = c("NR" = "Non-Responder", "R" = "Responder")) +
+  theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5), text = element_text(size = 30), axis.text = element_text(color = "black"), axis.title.y = ggtext::element_markdown())
+
+ggsave("Fig2F.pdf", device = "pdf", height = 6, width = 10, dpi = 300)
+```
+
+Statistical model to check for a difference between R/NR:
+
+```{r L. reuteri model, message=FALSE, warning=FALSE}
+# model
+model_Lreuteri <- lmer(log(FC) ~ Responder + (1 | Donor), data = Lreuteri_clean %>% filter(Group == "Probiotics") %>% filter(!Timepoint %in% c("0", "3")))
+summary(model_Lreuteri)
+```
+
+## 16S qPCR
+
+Bacterial load per donor over time. This recreates Fig. S3A:
+
+```{r 16S qPCR raw, message=FALSE, warning=FALSE}
+qPCR_16S_avg$Donor <- factor(qPCR_16S_avg$Donor, 
+                                levels = c("7038", "7014", "7019", "7024", "7017", "7005", "7015", "7023"),
+                                labels = c("7038 (NR)", "7014 (NR)", "7019 (NR)", "7024 (NR)", "7017 (R)", "7005 (R)", "7015 (R)", "7023 (R)"))
+
+ggplot(qPCR_16S_avg, aes(x = Timepoint, y = Average_FC, color = Group, group = Donor_Group)) +
+  geom_line(size = 0.8) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = Average_FC - SE_FC, ymax = Average_FC + SE_FC), width = 0.1) +
+  labs(title = "",
+       x = "Day",
+       y = "Bacterial load (Fold Change)",
+       color = NULL) +
+  scale_color_manual(values = c("Probiotics" = "#56B4E9", "Control" = "#E69F00")) +
+  scale_y_continuous(trans = "log2") +
+  geom_hline(yintercept = 1, color = "black", linetype = "dashed", linewidth = 0.5) +
+  annotate("rect", xmin = 2, xmax = 7, ymin = 0, ymax = Inf, fill = "grey",alpha = 0.3) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5), text = element_text(size = 20), axis.text = element_text(color = "black")) +
+  facet_wrap(~ Donor, nrow = 2)
+
+ggsave("FigS3A.pdf", device = "pdf", height = 6, width = 12, dpi = 300)
+```
+
+Double-normalized bacterial load over time. This recreates Fig. 3A:
+
+```{r 16S qPCR norm, message=FALSE, warning=FALSE}
+ggplot(qPCR_16S_norm_ctrl_t3_avg %>% filter(Group == "Probiotics"), aes(x = Timepoint, y = Average_Norm_ctrl_t3_FC, color = Responder, group = Donor)) +
+  geom_line(size = 0.8) +
+  geom_point(size = 2) +
+  geom_errorbar(aes(ymin = Average_Norm_ctrl_t3_FC - SE_Norm_ctrl_t3_FC, ymax = Average_Norm_ctrl_t3_FC + SE_Norm_ctrl_t3_FC), width = 0.1) +
+  geom_line(data = qPCR_16S_norm_ctrl_t3_avg_responders %>% filter(Group == "Probiotics"), aes(y = avg_resp_FC, group = Responder), size = 1, linetype = "dashed") +
+  geom_ribbon(data = qPCR_16S_norm_ctrl_t3_avg_responders %>% filter(Group == "Probiotics"), aes(y = avg_resp_FC, ymin = avg_resp_FC - avg_resp_SE_FC, ymax = avg_resp_FC + avg_resp_SE_FC, group = Responder, fill = Responder), alpha = 0.15, color = NA) +
+  labs(title = "",
+       x = "Day",
+       y = "Bacterial load<br><span style='font-size:20pt;'>(Relative to control and Day 3)</span>",
+       color = NULL,
+       fill = NULL) +
+  scale_color_manual(values = c("NR" = "#800080", "R" = "#008000"), labels = c("NR" = "Non-Responder", "R" = "Responder")) +
+  scale_fill_manual(values = c("NR" = "#800080", "R" = "#008000"), labels = c("NR" = "Non-Responder", "R" = "Responder")) +
+  scale_y_continuous(trans = "log2") +
+  geom_hline(yintercept = 1, color = "black", linetype = "dashed", linewidth = 0.5) +
+  annotate("rect", xmin = 2, xmax = 7, ymin = 0, ymax = Inf, fill = "grey",alpha = 0.3) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5), text = element_text(size = 30), axis.text = element_text(color = "black"), axis.title.y = ggtext::element_markdown(size = 30, color = "black"))
+
+ggsave("Fig3A.pdf", device = "pdf", height = 6, width = 10, dpi = 300)
+```
+
+Statistical model to check for a difference between R/NR:
+
+```{r 16S qPCR model, message=FALSE, warning=FALSE}
+# model
+model_16SqPCR <- lmer(log(Double_Normalized_FC) ~ Responder + (1 | Donor), data = qPCR_16S_norm_ctrl_t3 %>% filter(Group == "Probiotics") %>% filter(!Timepoint %in% c("0", "3")))
+summary(model_16SqPCR)
+```
+
+## TLR4
+
+LPS levels over time, per donor. This recreates Fig. S5A:
+
+```{r TLR4 raw, message=FALSE, warning=FALSE}
+tlr4_avg$Donor <- factor(tlr4_avg$Donor, 
+                                levels = c("7038", "7014", "7019", "7024", "7017", "7005", "7015", "7023"),
+                                labels = c("7038 (NR)", "7014 (NR)", "7019 (NR)", "7024 (NR)", "7017 (R)", "7005 (R)", "7015 (R)", "7023 (R)"))
+
+# replace the 0 value by 0.0001, which we set as our limit of detection
+tlr4_avg <- tlr4_avg %>% mutate(Average_LPS = if_else(Average_LPS == 0, 0.0001, Average_LPS))
+
+ggplot(tlr4_avg, aes(x = Timepoint, y = Average_LPS, color = Group, group = Donor_Group)) +
+  geom_line(size = 0.8) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = Average_LPS - SE_LPS, ymax = Average_LPS + SE_LPS), width = 0.1) +
+  labs(title = "",
+       x = "Day",
+       y = "LPS (µg/mL)",
+       color = NULL) +
+  scale_y_log10(breaks = c(0.0001, 0.001, 0.01, 0.1, 1), labels = c(0.0001, 0.001, 0.01, 0.1, 1)) +
+  scale_color_manual(values = c("Probiotics" = "#56B4E9", "Control" = "#E69F00")) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5), text = element_text(size = 20), axis.text = element_text(color = "black")) +
+  geom_hline(yintercept = 0.0001, linetype = "dashed", color = "black") +
+  annotate("text", x = Inf, y = 0.00017, label = "LOD", color = "black", hjust = 1.1, size = 4) +
+  annotate("rect", xmin = 2, xmax = 7, ymin = 0, ymax = Inf, fill = "grey",alpha = 0.3) +
+  facet_wrap(~ Donor, nrow = 2)
+
+ggsave("FigS5A.pdf", device = "pdf", height = 6, width = 12, dpi = 300)
+```
+
+Double normalized LPS levels over time. This recreates Fig. 5A:
+
+```{r TLR4 double norm, message=FALSE, warning=FALSE}
+ggplot(tlr4_norm_ctrl_t3_probiotics_avg, aes(x = Timepoint, y = Average_LPS, color = Responder, group = Donor)) +
+  geom_line(size = 0.8) +
+  geom_point(size = 2) +
+  geom_errorbar(aes(ymin = Average_LPS - SE_LPS, ymax = Average_LPS + SE_LPS), width = 0.1) +
+  geom_line(data = tlr4_norm_ctrl_t3_probiotics_avg_responders, aes(y = avg_resp_FC, group = Responder), size = 1, linetype = "dashed") +
+  geom_ribbon(data = tlr4_norm_ctrl_t3_probiotics_avg_responders, aes(y = avg_resp_FC, ymin = avg_resp_FC - avg_resp_SE_FC, ymax = avg_resp_FC + avg_resp_SE_FC, group = Responder, fill = Responder), alpha = 0.15, color = NA) +
+  labs(title = "",
+       x = "Day",
+       y = "LPS\n(Relative to control and Day 3)",
+       color = NULL,
+       fill = NULL) +
+  scale_color_manual(values = c("NR" = "#800080", "R" = "#008000"), labels = c("NR" = "Non-Responder", "R" = "Responder")) +
+  scale_fill_manual(values = c("NR" = "#800080", "R" = "#008000"), labels = c("NR" = "Non-Responder", "R" = "Responder")) +
+  geom_hline(yintercept = 1, color = "black", linetype = "dashed", linewidth = 0.5) +
+  scale_y_continuous(trans = "log2") +
+  annotate("rect", xmin = 1, xmax = 6, ymin = 0, ymax = Inf, fill = "grey",alpha = 0.3) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5), text = element_text(size = 30), axis.text = element_text(color = "black"))
+
+ggsave("Fig5A.pdf", device = "pdf", height = 6, width = 10, dpi = 300)
+```
+
+Statistical model to check for a difference between R/NR:
+
+```{r TLR4 model, message=FALSE, warning=FALSE}
+# model
+model_LPS <- lmer(log(Double_Normalized_LPS + 1) ~ Responder + (1 | Donor), data = tlr4_norm_ctrl_t3_probiotics %>% filter(Group == "Probiotics") %>% filter(!Timepoint %in% c("0", "3")))
+summary(model_LPS)
+```
+
+## TLR5
+
+Flagellin levels over time, per donor. This recreates Fig. S5B:
+
+```{r TLR5 raw, message=FALSE, warning=FALSE}
+tlr5_avg$Donor <- factor(tlr5_avg$Donor, 
+                                levels = c("7038", "7014", "7019", "7024", "7017", "7005", "7015", "7023"),
+                                labels = c("7038 (NR)", "7014 (NR)", "7019 (NR)", "7024 (NR)", "7017 (R)", "7005 (R)", "7015 (R)", "7023 (R)"))
+
+ggplot(tlr5_avg, aes(x = Timepoint, y = Average_Flagellin, color = Group, group = Donor_Group)) +
+  geom_line(size = 0.8) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = Average_Flagellin - SE_Flagellin, ymax = Average_Flagellin + SE_Flagellin), width = 0.1) +
+  labs(title = "",
+       x = "Day",
+       y = "Flagellin (µg/mL)",
+       color = NULL) +
+  scale_y_log10() +
+  scale_color_manual(values = c("Probiotics" = "#56B4E9", "Control" = "#E69F00")) +
+  annotate("rect", xmin = 2, xmax = 7, ymin = 0, ymax = Inf, fill = "grey",alpha = 0.3) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5), text = element_text(size = 20), axis.text = element_text(color = "black")) +
+  facet_wrap(~ Donor, nrow = 2)
+
+ggsave("FigS5B.pdf", device = "pdf", height = 6, width = 12, dpi = 300)
+```
+
+Double normalized flagellin levels over time. This recreates Fig. 5B:
+
+```{r TLR5 double norm, message=FALSE, warning=FALSE}
+ggplot(tlr5_norm_ctrl_t3_probiotics_avg, aes(x = Timepoint, y = Average_Flagellin, color = Responder, group = Donor)) +
+  geom_line(size = 0.8) +
+  geom_point(size = 2) +
+  geom_errorbar(aes(ymin = Average_Flagellin - SE_Flagellin, ymax = Average_Flagellin + SE_Flagellin), width = 0.1) +
+  geom_line(data = tlr5_norm_ctrl_t3_probiotics_avg_responders, aes(y = avg_resp_FC, group = Responder), size = 1, linetype = "dashed") +
+  geom_ribbon(data = tlr5_norm_ctrl_t3_probiotics_avg_responders, aes(y = avg_resp_FC, ymin = avg_resp_FC - avg_resp_SE_FC, ymax = avg_resp_FC + avg_resp_SE_FC, group = Responder, fill = Responder), alpha = 0.15, color = NA) +
+  labs(title = "",
+       x = "Day",
+       y = "Flagellin\n(Relative to control and Day 3)",
+       color = NULL,
+       fill = NULL) +
+  scale_color_manual(values = c("NR" = "#800080", "R" = "#008000"), labels = c("NR" = "Non-Responder", "R" = "Responder")) +
+  scale_fill_manual(values = c("NR" = "#800080", "R" = "#008000"), labels = c("NR" = "Non-Responder", "R" = "Responder")) +
+  geom_hline(yintercept = 1, color = "black", linetype = "dashed", linewidth = 0.5) +
+  scale_y_continuous(trans = "log2") +
+  annotate("rect", xmin = 1, xmax = 6, ymin = 0, ymax = Inf, fill = "grey",alpha = 0.3) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5), text = element_text(size = 30), axis.text = element_text(color = "black"))
+
+ggsave("Fig5B.pdf", device = "pdf", height = 6, width = 10, dpi = 300)
+```
+
+Statistical model to check for a difference between R/NR:
+
+```{r TLR5 model, message=FALSE, warning=FALSE}
+# model
+model_Flagellin <- lmer(log(Double_Normalized_Flagellin) ~ Responder + (1 | Donor), data = tlr5_norm_ctrl_t3_probiotics %>% filter(Group == "Probiotics") %>% filter(!Timepoint %in% c("0", "3")))
+summary(model_Flagellin)
+```
+
+# 16S
+
+## Alpha diversity
+
+Alpha diversity over time, per donor. This recreates Fig. S3B:
+
+```{r Alpha diversity raw, message=FALSE, warning=FALSE}
+shannon_raw_mean$Donor <- factor(shannon_raw_mean$Donor, 
+                                levels = c("7038", "7014", "7019", "7024", "7017", "7005", "7015", "7023"),
+                                labels = c("7038 (NR)", "7014 (NR)", "7019 (NR)", "7024 (NR)", "7017 (R)", "7005 (R)", "7015 (R)", "7023 (R)"))
+
+ggplot(shannon_raw_mean, aes(x = Timepoint, y = Average_Shannon, color = Group, group = Donor_Group)) +
+  geom_line(size = 0.8) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = Average_Shannon - SE_Shannon, ymax = Average_Shannon + SE_Shannon), width = 0.1) +
+  labs(title = "",
+       x = "Day",
+       y = "Alpha diversity (Shannon)",
+       color = NULL) +
+  scale_color_manual(values = c("Probiotics" = "#56B4E9", "Control" = "#E69F00")) +
+  annotate("rect", xmin = 2, xmax = 7, ymin = 2.75, ymax = Inf, fill = "grey",alpha = 0.3) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5), text = element_text(size = 20), axis.text = element_text(color = "black")) +
+  facet_wrap(~ Donor, nrow = 2)
+
+ggsave("FigS3B.pdf", device = "pdf", height = 6, width = 12, dpi = 300)
+```
+
+Double-normalized alpha diversity over time. This recreates Fig. 3B:
+
+```{r Alpha diversity double norm, message=FALSE, warning=FALSE}
+ggplot(shannon_probio_mean_t3, aes(x = as.factor(Time), y = Mean, color = Responder, group = Variable)) +
+  geom_line(size = 0.8) +
+  geom_point(size = 2) +
+  geom_errorbar(aes(ymin = Mean - SE, ymax = Mean + SE), width = 0.1) +
+  geom_line(data = shannon_probio_mean_t3_responders, aes(y = avg_resp, group = Responder), size = 1, linetype = "dashed") +
+  geom_ribbon(data = shannon_probio_mean_t3_responders, aes(y = avg_resp, ymin = avg_resp - avg_resp_SE, ymax = avg_resp + avg_resp_SE, group = Responder, fill = Responder), alpha = 0.15, color = NA) +
+  labs(title = "",
+       x = "Day",
+       y = "Alpha diversity<br><span style='font-size:20pt;'>(Shannon, Relative to control and Day 3)</span>",
+       color = NULL,
+       fill = NULL) +
+  scale_color_manual(values = c("NR" = "#800080", "R" = "#008000"), labels = c("NR" = "Non-Responder", "R" = "Responder")) +
+  scale_fill_manual(values = c("NR" = "#800080", "R" = "#008000"), labels = c("NR" = "Non-Responder", "R" = "Responder")) +
+  geom_hline(yintercept = 1, color = "black", linetype = "dashed", linewidth = 0.5) +
+  annotate("rect", xmin = 1, xmax = 6, ymin = 0.7, ymax = Inf, fill = "grey",alpha = 0.3) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5), text = element_text(size = 30), axis.text = element_text(color = "black"), axis.title.y = ggtext::element_markdown(size = 30, color = "black"))
+
+ggsave("Fig3B.pdf", device = "pdf", height = 6, width = 10, dpi = 300)
+```
+
+Statistical model to check for a difference between R/NR:
+
+```{r Alpha diversity model, message=FALSE, warning=FALSE}
+# model
+model_alpha <- lmer(Value ~ Responder + (1 | Variable), data = shannon_probio_long %>% filter(Label == "Probiotics") %>% filter(!Time %in% c(0, 3)))
+summary(model_alpha)
+```
+
+## Beta diversity
+
+Double-normalized beta-diversity over time. This recreates Fig. 3C:
+
+```{r Beta diversity double norm, message=FALSE, warning=FALSE}
+ggplot(bc_probio_mean_t3, aes(x = as.factor(Time), y = Mean, color = Responder, group = Variable)) +
+  geom_line(size = 0.8) +
+  geom_point(size = 2) +
+  geom_errorbar(aes(ymin = Mean - SE, ymax = Mean + SE), width = 0.1) +
+  geom_line(data = bc_probio_mean_t3_responders, aes(y = avg_resp, group = Responder), size = 1, linetype = "dashed") +
+  geom_ribbon(data = bc_probio_mean_t3_responders, aes(y = avg_resp, ymin = avg_resp - avg_resp_SE, ymax = avg_resp + avg_resp_SE, group = Responder, fill = Responder), alpha = 0.15, color = NA) +
+  labs(title = "",
+       x = "Day",
+       y = "Beta diversity<br><span style='font-size:20pt;'>(Bray-Curtis, Relative to control and Day 3)</span>",
+       color = NULL,
+       fill = NULL) +
+  scale_color_manual(values = c("NR" = "#800080", "R" = "#008000"), labels = c("NR" = "Non-Responder", "R" = "Responder")) +
+  scale_fill_manual(values = c("NR" = "#800080", "R" = "#008000"), labels = c("NR" = "Non-Responder", "R" = "Responder")) +
+  geom_hline(yintercept = 1, color = "black", linetype = "dashed", linewidth = 0.5) +
+  annotate("rect", xmin = 1, xmax = 6, ymin = 0, ymax = Inf, fill = "grey",alpha = 0.3) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5), text = element_text(size = 30), axis.text = element_text(color = "black"), axis.title.y = ggtext::element_markdown(size = 30, color = "black"))
+
+ggsave("Fig3C.pdf", device = "pdf", height = 6, width = 10, dpi = 300)
+```
+
+Statistical model to check for a difference between R/NR:
+
+```{r Beta diversity, message=FALSE, warning=FALSE}
+# model 
+model_beta <- lmer(log(Value) ~ Responder + (1 | Variable), data = bc_probio_long %>% filter(Label == "Probiotics") %>% filter(!Time %in% c(0, 3)))
+summary(model_beta)
+```
+
+## PCoA
+
+PCoA colored by donor. This recreates Fig. S3C:
+
+```{r PCoA Donor All, message=FALSE, warning=FALSE}
+# re-arrange donor order by non-responder, then responders
+pcoa_full_meta$Donor <- factor(pcoa_full_meta$Donor, levels = c("Donor_7038", "Donor_7014", "Donor_7019", "Donor_7024", "Donor_7017", "Donor_7005", "Donor_7015", "Donor_7023"))
+
+# plot
+ggplot(pcoa_full_meta, aes(x = PC1, y = PC2, color = Donor)) +
+  geom_point(size = 2) +
+  theme_minimal() +
+  labs(title = ,
+       x = paste0("PC1 (", pc1_full_all, "%)"),
+       y = paste0("PC2 (", pc2_full_all, "%)")) +
+  theme_classic() +
+  scale_color_manual(values = c("Donor_7005" = "#1F77B4", "Donor_7014" = "#FF7F0E", "Donor_7015" = "#2CA02C", "Donor_7017" = "#D62728", "Donor_7019" = "#9467BD", "Donor_7023" = "#8C564B", "Donor_7024" = "#E377C2", "Donor_7038" = "#7F7F7F"), labels = c("Donor_7005" = "7005", "Donor_7014" = "7014", "Donor_7015" = "7015", "Donor_7017" = "7017", "Donor_7019" = "7019", "Donor_7023" = "7023", "Donor_7024" = "7024", "Donor_7038" = "7038")) +
+  theme(text = element_text(size = 20), axis.text = element_text(color = "black"))
+
+ggsave("FigS3C.pdf", device = "pdf", height = 8, width = 12, dpi = 300)
+```
+
+## Maaslin
+
+Maaslin3 output for the "Group" variable (q < 0.05). This recreates Fig. 4A:
+
+```{r Maaslin probiotics, message=FALSE, warning=FALSE}
+# remove T0 and T3
+input_maaslin_post_t3 <- input_maaslin[!rownames(input_maaslin) %in% rownames(metadata_maaslin %>% filter(Timepoint %in% c("T0", "T3"))),]
+metadata_maaslin_post_t3 <- metadata_maaslin[!rownames(metadata_maaslin) %in% rownames(metadata_maaslin %>% filter(Timepoint %in% c("T0", "T3"))),]
+
+# only keep the genus, remove the data with undefined genus
+input_maaslin_post_t3 <- input_maaslin_post_t3 %>%
+    select(-ends_with("__"))
+
+# recompute relative abundances (sum per samples = 100)
+input_maaslin_post_t3_rel <- sweep(input_maaslin_post_t3, 1, rowSums(input_maaslin_post_t3), FUN = "/") * 100
+
+# Maaslin3 model
+donor_responder_interaction_m3 <- maaslin3(input_data = input_maaslin_post_t3_rel,
+                    input_metadata = metadata_maaslin_post_t3,
+                    output = "/pasteur/helix/projects/Analyse_MHI_Zeus/Quentin_ZEUS/MBRA_Protobiotics/16S/Maaslin/donor_responder_interaction_m3",
+                    formula = '~ Group * Responder + (1|Donor)',
+                    normalization = 'TSS',
+                    transform = 'LOG',
+                    augment = TRUE,
+                    standardize = TRUE,
+                    max_significance = 0.25,
+                    median_comparison_abundance = TRUE,
+                    median_comparison_prevalence = FALSE)
+
+# extract the results 
+m3_ab <- donor_responder_interaction_m3$fit_data_abundance$results
+m3_prev <- donor_responder_interaction_m3$fit_data_prevalence$results
+
+# additional filter: joint q-val < 0.05
+m3_ab_filter <- m3_ab %>% filter(qval_joint < 0.05)
+dim(m3_ab_filter)
+
+# add prevalence coef and qval
+m3_both_filter <- m3_ab_filter %>%
+  rename(coef_ab = coef, qval_ab = qval_individual) %>%
+  left_join(m3_prev %>% select(feature, metadata, value, name, coef, qval_individual), by = c("feature", "metadata", "value", "name")) %>%
+  rename(coef_prev = coef, qval_prev = qval_individual) 
+
+# prepare for plotting: order by decreasing values of coef (using the biggest value of prevalence/abundance), create a shape for abundance and prevalence
+m3_both_filter_graph <- m3_both_filter %>%
+  mutate(feature = str_replace(feature, ".*\\.g__", "")) %>%
+  mutate(max_coef = case_when(qval_ab < 0.05 & (qval_prev >= 0.05 | coef_ab >= coef_prev) ~ coef_ab,
+                              qval_prev < 0.05 & (qval_ab >= 0.05 | coef_prev > coef_ab) ~ coef_prev,
+                              TRUE ~ NA_real_)) %>%
+  gather(key = "param", value = "coef", coef_ab, coef_prev) %>%
+  gather(key = "qval_param", value = "qval", qval_ab, qval_prev) %>%
+  filter((param == "coef_ab" & qval_param == "qval_ab" & qval < 0.05) | 
+         (param == "coef_prev" & qval_param == "qval_prev" & qval < 0.05)) %>%
+  mutate(Association = ifelse(param == "coef_ab", "Abundance", "Prevalence"))
+
+# number of hits per condition
+ggplot(as.data.frame(table(m3_both_filter$name)), aes(x = Var1, y = Freq)) +
+  geom_bar(stat = "identity", fill = "steelblue", width = 0.2) +
+  labs(title = "", x = "", y = "Frequency") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# coef > 0 = more in the probiotics
+ggplot(m3_both_filter_graph %>% filter(name == "GroupProbiotics"), aes(x = reorder(feature, -max_coef))) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 1) +
+  geom_point(aes(y = coef, shape = Association, fill = qval_joint), size = 4, na.rm = TRUE) +
+  labs(x = "Genus", y = "Coefficient", fill = "q-value", shape = "Association") +
+  scale_fill_gradient(low = "#d73027", high = "#fee0d2") +
+  scale_shape_manual(values = c("Abundance" = 21, "Prevalence" = 24)) +
+  coord_flip() +
+  theme_linedraw() +
+  theme(text = element_text(size = 25), panel.grid.minor = element_line(color = "grey85"), panel.grid.major = element_line(color = "grey85")) +
+  guides(shape = guide_legend(order = 1), color = guide_legend(order = 2))
+
+ggsave("Fig4A.pdf", device = "pdf", height = 8, width = 10, dpi = 300)
+```
+
+Maaslin3 output for the "Group*Responder" variable (q < 0.05). This recreates Fig. 4B:
+
+```{r Maaslin probiotics:responder, message=FALSE, warning=FALSE}
+# coef > 0 = more in the R compared to NR for the probiotics group
+ggplot(m3_both_filter_graph %>% filter(name == "GroupProbiotics:ResponderR"), aes(x = reorder(feature, -max_coef))) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 1) +
+  geom_point(aes(y = coef, shape = Association, fill = qval_joint), size = 4, na.rm = TRUE) +
+  labs(x = "Genus", y = "Coefficient", fill = "q-value", shape = "Association") +
+  scale_fill_gradient(low = "#d73027", high = "#fee0d2") +
+  scale_shape_manual(values = c("Abundance" = 21, "Prevalence" = 24)) +
+  coord_flip() +
+  theme_linedraw() +
+  theme(text = element_text(size = 25), panel.grid.minor = element_line(color = "grey85"), panel.grid.major = element_line(color = "grey85")) +
+  guides(shape = guide_legend(order = 1), color = guide_legend(order = 2))
+
+ggsave("Fig4B.pdf", device = "pdf", height = 8, width = 10, dpi = 300)
+```
+
+Maaslin3 output for the "Responder" variable (q < 0.05). This recreates Fig. S4:
+
+```{r Maaslin responder, message=FALSE, warning=FALSE}
+# coef > 0 = more in the R
+ggplot(m3_both_filter_graph %>% filter(name == "ResponderR"), aes(x = reorder(feature, -max_coef))) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 1) +
+  geom_point(aes(y = coef, shape = Association, fill = qval_joint), size = 4, na.rm = TRUE) +
+  labs(x = "Genus", y = "Coefficient", fill = "q-value", shape = "Association") +
+  scale_fill_gradient(low = "#d73027", high = "#fee0d2") +
+  scale_shape_manual(values = c("Abundance" = 21, "Prevalence" = 24)) +
+  coord_flip() +
+  theme_linedraw() +
+  theme(text = element_text(size = 25), panel.grid.minor = element_line(color = "grey85"), panel.grid.major = element_line(color = "grey85")) +
+  guides(shape = guide_legend(order = 1), color = guide_legend(order = 2))
+
+ggsave("FigS4.pdf", device = "pdf", height = 6, width = 8, dpi = 300)
+```
+
+# Multivariate PCoA 
+
+## PCoA 
+
+Multivariate PCoA comparing Control and Probiotics. This recreates Fig. 6A:
+
+```{r Multivariate PCoA Control vs Probiotics, message=FALSE, warning=FALSE}
+# BC distance
+multivariate_bc <- as.matrix(vegdist(multivariate_D10_all_clean, method = "bray"))
+
+# PCoA
+pcoa_multivariate <- cmdscale(as.dist(multivariate_bc), k = 2, eig = TRUE)
+# PCoA coordinates
+pcoa_multivariate_df <- data.frame(Sample = rownames(pcoa_multivariate$points),
+                      PC1 = pcoa_multivariate$points[, 1],
+                      PC2 = pcoa_multivariate$points[, 2])
+
+# add metadata
+pcoa_multivariate_meta <- merge(pcoa_multivariate_df, metadata_multivariate, by = "Sample")
+
+# variance explained
+pcoa_multivariate_variance <- 100 * (pcoa_multivariate$eig / sum(pcoa_multivariate$eig))
+pc1_multivariate_all <- round(pcoa_multivariate_variance[1], 2)
+pc2_multivariate_all <- round(pcoa_multivariate_variance[2], 2)
+
+# prepare arrows for plotting (envfit)
+envfit(pcoa_multivariate, multivariate_D10_all_clean, permutations = 999)
+env_fit <- envfit(pcoa_multivariate, multivariate_D10_all_clean, permutations = 999)
+# generate a dataframe
+env_vectors_df <- as.data.frame(scores(env_fit, display = "vectors"))
+colnames(env_vectors_df) <- c("PC1", "PC2")
+rownames(env_vectors_df) <- gsub("_", " ", rownames(env_vectors_df))
+# scale the axis (0.5x size)
+env_vectors_df <- env_vectors_df * 0.3
+
+# prepare centroids for plotting
+centroids_pcoa_all <- pcoa_multivariate_meta %>%
+  group_by(Group) %>%
+  summarize(PC1_centroid = mean(PC1), PC2_centroid = mean(PC2))
+
+# add centroids to PCoA data
+pcoa_centroids_all <- pcoa_multivariate_meta %>%
+  left_join(centroids_pcoa_all, by = "Group")
+
+# adonis test
+adonis2(as.dist(multivariate_bc) ~ Group, data = metadata_multivariate)
+adonis2_multivariate <- round(adonis2(as.dist(multivariate_bc) ~ Group, data = metadata_multivariate)$`Pr(>F)`[1], 3)
+
+# plot
+ggplot(pcoa_centroids_all, aes(x = PC1, y = PC2, color = Group)) +
+  geom_point(size = 3) +
+  geom_segment(aes(xend = PC1_centroid, yend = PC2_centroid, color = Group), linetype = "solid") +
+  geom_point(data = centroids_pcoa_all, aes(x = PC1_centroid, y = PC2_centroid, fill = Group), size = 6, shape = 21, show.legend = FALSE) +
+  theme_minimal() +
+  labs(title = paste0("Adonis2: p = ", adonis2_multivariate),
+       x = paste0("PC1 (", pc1_multivariate_all, "%)"),
+       y = paste0("PC2 (", pc2_multivariate_all, "%)"),
+       color = NULL,
+       fill = NULL) +
+  theme_classic() +
+  theme(text = element_text(size = 25), axis.text = element_text(color = "black")) +
+  scale_color_manual(values = c("Probiotics" = "#56B4E9", "Control" = "#E69F00")) +
+  scale_fill_manual(values = c("Probiotics" = "#56B4E9", "Control" = "#E69F00")) +
+  geom_segment(data = env_vectors_df, aes(x = 0, y = 0, xend = PC1, yend = PC2, color = NULL, shape = NULL), arrow = arrow(length = unit(0.3, "cm")), size = 1, show.legend = FALSE) +
+  geom_text(data = env_vectors_df, aes(x = PC1, y = PC2, label = rownames(env_vectors_df), color = NULL, shape = NULL), nudge_x = 0.04, nudge_y = 0.03, size = 7, show.legend = FALSE)
+
+ggsave("Fig6A.pdf", device = "pdf", height = 8, width = 12, dpi = 300)
+```
+
+Multivariate PCoA comparing Responder and Non-Responders for Control chambers. This recreates Fig. 6B:
+
+```{r Multivariate PCoA R vs NR for control, message=FALSE, warning=FALSE}
+# only keep control for raw data
+multivariate_D10_control <- multivariate_D10_all_clean %>% 
+  mutate(Sample = rownames(multivariate_D10_all_clean)) %>%
+  left_join(metadata_multivariate %>% select(Sample, Group), by = "Sample") %>%
+  filter(Group == "Control") %>%
+  select(-Sample, -Group)
+  
+# only keep control for metadata
+metadata_multivariate_control <- metadata_multivariate %>% filter(Group == "Control")
+
+# only keep probiotics for distance matrix
+multivariate_bc_control <- multivariate_bc[rownames(multivariate_bc) %in% metadata_multivariate_control$Sample, colnames(multivariate_bc) %in% metadata_multivariate_control$Sample]
+
+# PCoA
+pcoa_multivariate_control <- cmdscale(as.dist(multivariate_bc_control), k = 2, eig = TRUE)
+# PCoA coordinates
+pcoa_multivariate_control_df <- data.frame(Sample = rownames(pcoa_multivariate_control$points),
+                      PC1 = pcoa_multivariate_control$points[, 1],
+                      PC2 = pcoa_multivariate_control$points[, 2])
+
+# add metadata
+pcoa_multivariate_meta_control <- merge(pcoa_multivariate_control_df, metadata_multivariate_control, by = "Sample")
+
+# variance explained
+pcoa_multivariate_variance_control <- 100 * (pcoa_multivariate_control$eig / sum(pcoa_multivariate_control$eig))
+pc1_multivariate_control <- round(pcoa_multivariate_variance_control[1], 2)
+pc2_multivariate_control <- round(pcoa_multivariate_variance_control[2], 2)
+
+# prepare arrows for plotting (envfit)
+envfit(pcoa_multivariate_control, multivariate_D10_control, permutations = 999)
+env_fit_control <- envfit(pcoa_multivariate_control, multivariate_D10_control, permutations = 999)
+# generate a dataframe
+env_vectors_control_df <- as.data.frame(scores(env_fit_control, display = "vectors"))
+colnames(env_vectors_control_df) <- c("PC1", "PC2")
+rownames(env_vectors_control_df) <- gsub("_", " ", rownames(env_vectors_control_df))
+# scale the axis (0.5x size)
+env_vectors_control_df <- env_vectors_control_df * 0.3
+
+# prepare centroids for plotting
+centroids_pcoa_control <- pcoa_multivariate_meta_control %>%
+  group_by(Responder) %>%
+  summarize(PC1_centroid = mean(PC1), PC2_centroid = mean(PC2))
+
+# add centroids to PCoA data
+pcoa_centroids_control <- pcoa_multivariate_meta_control %>%
+  left_join(centroids_pcoa_control, by = "Responder")
+
+# adonis test
+adonis2(as.dist(multivariate_bc_control) ~ Responder, data = metadata_multivariate_control)
+adonis2_multivariate_control <- round(adonis2(as.dist(multivariate_bc_control) ~ Responder, data = metadata_multivariate_control)$`Pr(>F)`[1], 3)
+
+# plot
+ggplot(pcoa_centroids_control, aes(x = PC1, y = PC2, color = Responder)) +
+  geom_point(size = 3) +
+  geom_segment(aes(xend = PC1_centroid, yend = PC2_centroid, color = Responder), linetype = "solid") +
+  geom_point(data = centroids_pcoa_control, aes(x = PC1_centroid, y = PC2_centroid, fill = Responder), size = 6, shape = 21, show.legend = FALSE) +
+  theme_minimal() +
+  labs(title = paste0("Adonis2: p = ", adonis2_multivariate_control),
+       x = paste0("PC1 (", pc1_multivariate_control, "%)"),
+       y = paste0("PC2 (", pc2_multivariate_control, "%)"),
+       color = NULL,
+       fill = NULL) +
+  theme_classic() +
+  theme(text = element_text(size = 25), axis.text = element_text(color = "black")) +
+  scale_color_manual(values = c("NR" = "#800080", "R" = "#008000"), labels = c("NR" = "Non-Responder", "R" = "Responder")) +
+  scale_fill_manual(values = c("NR" = "#800080", "R" = "#008000"), labels = c("NR" = "Non-Responder", "R" = "Responder")) +
+  geom_segment(data = env_vectors_control_df, aes(x = 0, y = 0, xend = PC1, yend = PC2, color = NULL, shape = NULL),
+               arrow = arrow(length = unit(0.3, "cm")), size = 1, show.legend = FALSE) +
+  geom_text(data = env_vectors_control_df, aes(x = PC1, y = PC2, label = rownames(env_vectors_control_df), color = NULL, shape = NULL), nudge_x = 0.04, nudge_y = 0.03, size = 7, show.legend = FALSE)
+
+ggsave("Fig6B.pdf", device = "pdf", height = 8, width = 12, dpi = 300)
+```
+
+Multivariate PCoA comparing Responder and Non-Responders for Probiotic-treated chambers. This recreates Fig. 6C:
+
+```{r Multivariate PCoA R vs NR for probiotics, message=FALSE, warning=FALSE}
+# only keep probiotics for raw data
+multivariate_D10_probiotics <- multivariate_D10_all_clean %>% 
+  mutate(Sample = rownames(multivariate_D10_all_clean)) %>%
+  left_join(metadata_multivariate %>% select(Sample, Group), by = "Sample") %>%
+  filter(Group == "Probiotics") %>%
+  select(-Sample, -Group)
+
+# only keep probiotics for metadata
+metadata_multivariate_probiotics <- metadata_multivariate %>% filter(Group == "Probiotics")
+
+# only keep probiotics for distance matrix
+multivariate_bc_probiotics <- multivariate_bc[rownames(multivariate_bc) %in% metadata_multivariate_probiotics$Sample, colnames(multivariate_bc) %in% metadata_multivariate_probiotics$Sample]
+
+# PCoA
+pcoa_multivariate_probiotics <- cmdscale(as.dist(multivariate_bc_probiotics), k = 2, eig = TRUE)
+# PCoA coordinates
+pcoa_multivariate_probiotics_df <- data.frame(Sample = rownames(pcoa_multivariate_probiotics$points),
+                      PC1 = pcoa_multivariate_probiotics$points[, 1],
+                      PC2 = pcoa_multivariate_probiotics$points[, 2])
+
+# add metadata
+pcoa_multivariate_meta_probiotics <- merge(pcoa_multivariate_probiotics_df, metadata_multivariate_probiotics, by = "Sample")
+
+# variance explained
+pcoa_multivariate_variance_probiotics <- 100 * (pcoa_multivariate_probiotics$eig / sum(pcoa_multivariate_probiotics$eig))
+pc1_multivariate_probiotics <- round(pcoa_multivariate_variance_probiotics[1], 2)
+pc2_multivariate_probiotics <- round(pcoa_multivariate_variance_probiotics[2], 2)
+
+# prepare arrows for plotting (envfit)
+envfit(pcoa_multivariate_probiotics, multivariate_D10_probiotics, permutations = 999)
+env_fit_probiotics <- envfit(pcoa_multivariate_probiotics, multivariate_D10_probiotics, permutations = 999)
+# generate a dataframe
+env_vectors_probiotics_df <- as.data.frame(scores(env_fit_probiotics, display = "vectors"))
+colnames(env_vectors_probiotics_df) <- c("PC1", "PC2")
+rownames(env_vectors_probiotics_df) <- gsub("_", " ", rownames(env_vectors_probiotics_df))
+# scale the axis (0.5x size)
+env_vectors_probiotics_df <- env_vectors_probiotics_df * 0.3
+
+# prepare centroids for plotting
+centroids_pcoa_probiotics <- pcoa_multivariate_meta_probiotics %>%
+  group_by(Responder) %>%
+  summarize(PC1_centroid = mean(PC1), PC2_centroid = mean(PC2))
+
+# add centroids to PCoA data
+pcoa_centroids_probiotics <- pcoa_multivariate_meta_probiotics %>%
+  left_join(centroids_pcoa_probiotics, by = "Responder")
+
+# adonis test
+adonis2(as.dist(multivariate_bc_probiotics) ~ Responder, data = metadata_multivariate_probiotics)
+adonis2_multivariate_probiotics <- round(adonis2(as.dist(multivariate_bc_probiotics) ~ Responder, data = metadata_multivariate_probiotics)$`Pr(>F)`[1], 3)
+
+# plot
+ggplot(pcoa_centroids_probiotics, aes(x = PC1, y = PC2, color = Responder)) +
+  geom_point(size = 3) +
+  geom_segment(aes(xend = PC1_centroid, yend = PC2_centroid, color = Responder), linetype = "solid") +
+  geom_point(data = centroids_pcoa_probiotics, aes(x = PC1_centroid, y = PC2_centroid, fill = Responder), size = 6, shape = 21, show.legend = FALSE) +
+  theme_minimal() +
+  labs(title = paste0("Adonis2: p = ", adonis2_multivariate_probiotics),
+       x = paste0("PC1 (", pc1_multivariate_probiotics, "%)"),
+       y = paste0("PC2 (", pc2_multivariate_probiotics, "%)"),
+       color = NULL,
+       fill = NULL) +
+  theme_classic() +
+  theme(text = element_text(size = 25), axis.text = element_text(color = "black")) +
+  scale_color_manual(values = c("NR" = "#800080", "R" = "#008000"), labels = c("NR" = "Non-Responder", "R" = "Responder")) +
+  scale_fill_manual(values = c("NR" = "#800080", "R" = "#008000"), labels = c("NR" = "Non-Responder", "R" = "Responder")) +
+  geom_segment(data = env_vectors_probiotics_df, aes(x = 0, y = 0, xend = PC1, yend = PC2, color = NULL, shape = NULL),
+               arrow = arrow(length = unit(0.3, "cm")), size = 1, show.legend = FALSE) +
+  geom_text(data = env_vectors_probiotics_df, aes(x = PC1, y = PC2, label = rownames(env_vectors_probiotics_df), color = NULL, shape = NULL), nudge_x = 0.04, nudge_y = 0.03, size = 7, show.legend = FALSE)
+
+ggsave("Fig6C.pdf", device = "pdf", height = 8, width = 12, dpi = 300)
+```
+
+## Per metric at T10
+
+### Bacterial load
+
+Pairwise comparion of bacterial load at T10. This recreates Fig. S6A:
+
+```{r R/NR T10 Bacterial load, message=FALSE, warning=FALSE}
+ggplot(multivariate_D10_all %>% filter(Group == "Probiotics"), aes(x = Responder, y = Bacterial_Load, color = Responder)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.1, size = 2, alpha = 0.7) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "black") +
+  labs(x = "", y = "Bacterial load<br><span style='font-size:20pt;'>(Relative value)</span>") +
+  scale_x_discrete(labels = c("NR" = "Non-Responder", "R" = "Responder")) +
+  scale_color_manual(values = c("NR" = "#800080", "R" = "#008000")) +
+  scale_y_continuous(expand = expansion(mult = 0.15)) +
+  theme_classic() +
+  theme(text = element_text(size = 25), legend.title = element_blank(), axis.text = element_text(color = "black"), legend.position = "none", , axis.title.y = ggtext::element_markdown(size = 30, color = "black")) +
+  stat_compare_means(method = "wilcox.test", label = "p.format", comparisons = list(c("R", "NR")), vjust = -0.2, size = 6)
+
+ggsave("FigS6A.pdf", device = "pdf", height = 6, width = 6, dpi = 300)
+```
+
+### Alpha diversity
+
+Pairwise comparion of alpha diversity at T10. This recreates Fig. S6B:
+
+```{r R/NR T10 Alpha diversity, message=FALSE, warning=FALSE}
+ggplot(multivariate_D10_all %>% filter(Group == "Probiotics"), aes(x = Responder, y = Shannon, color = Responder)) +
+  geom_boxplot(outlier.shape = NA, width = 0.4) +
+  geom_jitter(width = 0.1, size = 3, alpha = 0.7) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "black") +
+  labs(x = "", y = "Alpha diversity<br><span style='font-size:20pt;'>(Shannon, Relative value)</span>") +
+  scale_x_discrete(labels = c("NR" = "Non-Responder", "R" = "Responder")) +
+  scale_color_manual(values = c("NR" = "#800080", "R" = "#008000")) +
+  scale_y_continuous(expand = expansion(mult = 0.15)) +
+  theme_classic() +
+  theme(text = element_text(size = 25), legend.title = element_blank(), axis.text = element_text(color = "black"), legend.position = "none", , axis.title.y = ggtext::element_markdown(size = 30, color = "black")) +
+  stat_compare_means(method = "wilcox.test", label = "p.format", comparisons = list(c("R", "NR")), vjust = -0.2, size = 6)
+
+ggsave("FigS6B.pdf", device = "pdf", height = 6, width = 6, dpi = 300)
+```
+
+### Beta diversity
+
+Pairwise comparion of beta diversity at T10. This recreates Fig. S6C:
+
+```{r R/NR T10 Beta diversity, message=FALSE, warning=FALSE}
+ggplot(multivariate_D10_all %>% filter(Group == "Probiotics"), aes(x = Responder, y = Bray_Curtis, color = Responder)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.1, size = 2, alpha = 0.7) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "black") +
+  labs(x = "", y = "Beta diversity<br><span style='font-size:20pt;'>(Bray-Curtis, Relative value)</span>") +
+  scale_x_discrete(labels = c("NR" = "Non-Responder", "R" = "Responder")) +
+  scale_color_manual(values = c("NR" = "#800080", "R" = "#008000")) +
+  scale_y_continuous(expand = expansion(mult = 0.15)) +
+  theme_classic() +
+  theme(text = element_text(size = 25), legend.title = element_blank(), axis.text = element_text(color = "black"), legend.position = "none", , axis.title.y = ggtext::element_markdown(size = 30, color = "black")) +
+  stat_compare_means(method = "wilcox.test", label = "p.format", comparisons = list(c("R", "NR")), vjust = -0.2, size = 6)
+
+ggsave("FigS6C.pdf", device = "pdf", height = 6, width = 6, dpi = 300)
+```
+
+### Flagellin
+
+Pairwise comparion of flagellin at T10. This recreates Fig. S6D:
+
+```{r R/NR T10 TLR5, message=FALSE, warning=FALSE}
+ggplot(multivariate_D10_all %>% filter(Group == "Probiotics"), aes(x = Responder, y = Flagellin, color = Responder)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.1, size = 2, alpha = 0.7) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "black") +
+  labs(x = "", y = "Flagellin<br><span style='font-size:20pt;'>(Relative value)</span>") +
+  scale_x_discrete(labels = c("NR" = "Non-Responder", "R" = "Responder")) +
+  scale_color_manual(values = c("NR" = "#800080", "R" = "#008000")) +
+  scale_y_continuous(expand = expansion(mult = 0.15)) +
+  theme_classic() +
+  theme(text = element_text(size = 25), legend.title = element_blank(), axis.text = element_text(color = "black"), legend.position = "none", , axis.title.y = ggtext::element_markdown(size = 30, color = "black")) +
+  stat_compare_means(method = "wilcox.test", label = "p.format", comparisons = list(c("R", "NR")), vjust = -0.2, size = 6)
+
+ggsave("FigS6D.pdf", device = "pdf", height = 6, width = 6, dpi = 300)
+```
+
+### LPS
+
+Pairwise comparion of LPS at T10. This recreates Fig. S6E:
+
+```{r R/NR T10 TLR4, message=FALSE, warning=FALSE}
+ggplot(multivariate_D10_all %>% filter(Group == "Probiotics"), aes(x = Responder, y = LPS, color = Responder)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.1, size = 2, alpha = 0.7) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "black") +
+  labs(x = "", y = "LPS<br><span style='font-size:20pt;'>(Relative value)</span>") +
+  scale_x_discrete(labels = c("NR" = "Non-Responder", "R" = "Responder")) +
+  scale_color_manual(values = c("NR" = "#800080", "R" = "#008000")) +
+  scale_y_continuous(expand = expansion(mult = 0.15)) +
+  theme_classic() +
+  theme(text = element_text(size = 25), legend.title = element_blank(), axis.text = element_text(color = "black"), legend.position = "none", , axis.title.y = ggtext::element_markdown(size = 30, color = "black")) +
+  stat_compare_means(method = "wilcox.test", label = "p.format", comparisons = list(c("R", "NR")), vjust = -0.2, size = 6)
+
+ggsave("FigS6E.pdf", device = "pdf", height = 6, width = 6, dpi = 300)
+```
+
+# ROC Curves
+
+## Control
+
+ROC curve for control chambers. This recreates Fig. 6D:
+
+```{r ROC R/NR Control, message=FALSE, warning=FALSE}
+# Resampling loop: stratified split + RF + ROCR
+for (b in 1:B) {
+  
+  # ---- STRATIFIED Split: ~pct_val% per class in validation ----
+  idx_val <- unlist(tapply(seq_len(nrow(multivariate_D10_ROC_control_clean)), multivariate_D10_ROC_control_clean$outcome, function(idx) {
+    k <- max(1, round(length(idx) * pct_val / 100))   # at least 1 per validation class
+    sample(idx, size = k)
+  }))
+  
+  validation <- multivariate_D10_ROC_control_clean[idx_val, , drop = FALSE]
+  training   <- multivariate_D10_ROC_control_clean[-idx_val, , drop = FALSE]
+  
+  # ---- Empty levels drop (safety ----
+  training$outcome   <- droplevels(training$outcome)
+  validation$outcome <- droplevels(validation$outcome)
+  
+  # ---- Safety: if a class is missing from training, we skip it ----
+  if (nlevels(training$outcome) < length(classes)) next
+  
+  # ---- Random Forest ----
+  rf_classifier <- randomForest(outcome ~ ., data = training, ntree = ntree, importance = TRUE)
+  
+  # ---- Probabilities by class ----
+  prediction_ROC <- predict(rf_classifier, validation[, -1, drop = FALSE], type = "prob")
+  
+  # ---- ROCR : one-vs-rest per class + interpolation ----
+  for (i in seq_along(classes)) {
+    cls <- classes[i]
+    
+    # If the model doesn't have the column (which is possible if the class is missing from the training data), we skip it
+    if (!(cls %in% colnames(prediction_ROC))) next
+    
+    labels <- factor(ifelse(validation$outcome == cls, "pos", "neg"),
+                     levels = c("neg", "pos"))
+    scores <- as.numeric(prediction_ROC[, cls])
+    
+    ok <- !is.na(labels) & !is.na(scores)
+    labels2 <- labels[ok]
+    scores2 <- scores[ok]
+    
+    # If there are no positive or negative results in the validation for this class, ROC analysis is not possible
+    if (length(unique(labels2)) < 2) next
+    
+    pred <- ROCR::prediction(scores2, labels2)
+    perf <- ROCR::performance(pred, "tpr", "fpr")
+    
+    fpr <- perf@x.values[[1]]
+    tpr <- perf@y.values[[1]]
+    
+    # sorted / unique points
+    o <- order(fpr)
+    fpr <- fpr[o]; tpr <- tpr[o]
+    keep <- !duplicated(fpr)
+    fpr <- fpr[keep]; tpr <- tpr[keep]
+    
+    # Interpolation on the common grid
+    tpr_interp <- approx(x = fpr, y = tpr, xout = fpr_grid, rule = 2, ties = "ordered")$y
+    tpr_mat_list[[cls]][, b] <- tpr_interp
+    
+    # AUC
+    auc.perf <- ROCR::performance(pred, "auc")
+    auc_mat[cls, b] <- auc.perf@y.values[[1]]
+  }
+}
+
+# Summary: mean ± SD (based on B repetitions)
+roc_summary <- do.call(rbind, lapply(classes, function(cls) {
+  mat <- tpr_mat_list[[cls]]
+  
+  mean_tpr <- rowMeans(mat, na.rm = TRUE)
+  sd_tpr   <- apply(mat, 1, sd, na.rm = TRUE)
+  
+  data.frame(
+    fpr = fpr_grid,
+    mean = mean_tpr,
+    lower = pmax(0, mean_tpr - sd_tpr),
+    upper = pmin(1, mean_tpr + sd_tpr),
+    class = cls
+  )
+}))
+
+# Plot of mean ROC curve + bands representing standard deviation
+pdf(file = "Fig6D.pdf", height = 6, width = 6)
+colors <- c("#008000", "#800080")   # 4 classes
+
+par(mfrow = c(1, 1), cex = 1.2)
+plot(c(0, 1), c(0, 1), type = "n",
+     xlab = "False Positive Rate (FPR)", ylab = "True Positive Rate (TPR)",
+     main = "")
+
+for (i in seq_along(classes)) {
+  cls <- classes[i]
+  df <- roc_summary[roc_summary$class == cls, ]
+  
+  polygon(
+    x = c(df$fpr, rev(df$fpr)),
+    y = c(df$lower, rev(df$upper)),
+    col = adjustcolor(colors[i], alpha.f = 0.2),
+    border = NA)
+  lines(df$fpr, df$mean, col = colors[i], lwd = 2)}
+
+abline(0, 1, lty = 2)
+
+# Legend: AUC mean ± SD (based on B repetitions)
+auc_mean <- apply(auc_mat, 1, function(x) mean(x, na.rm = TRUE))
+auc_sd   <- apply(auc_mat, 1, function(x) sd(x, na.rm = TRUE))
+
+legend_labels <- sapply(seq_along(classes), function(i) {
+  cls <- classes[i]
+  sprintf("%s (AUC = %.3f ± %.3f)", cls, auc_mean[cls], auc_sd[cls])
+})
+
+legend("bottomright", legend = legend_labels, col = colors[seq_along(classes)], lwd = 2, bty = "n", cex = 1.1)
+
+dev.off()
+
+# classifier
+varImpPlot(rf_classifier)
+print(rf_classifier[["importance"]])
+```
+
+## Probiotics
+
+ROC curve for probiotic-treated chambers. This recreates Fig. 6E:
+
+```{r ROC R/NR Probiotics, message=FALSE, warning=FALSE}
+# Resampling loop: stratified split + RF + ROCR
+for (b in 1:B) {
+  
+  # ---- STRATIFIED Split: ~pct_val% per class in validation ----
+  idx_val <- unlist(tapply(seq_len(nrow(multivariate_D10_ROC_probiotics_clean)), multivariate_D10_ROC_probiotics_clean$outcome, function(idx) {
+    k <- max(1, round(length(idx) * pct_val / 100))   # at least 1 per validation class
+    sample(idx, size = k)
+  }))
+  
+  validation <- multivariate_D10_ROC_probiotics_clean[idx_val, , drop = FALSE]
+  training   <- multivariate_D10_ROC_probiotics_clean[-idx_val, , drop = FALSE]
+  
+  # ---- Empty levels drop (safety ----
+  training$outcome   <- droplevels(training$outcome)
+  validation$outcome <- droplevels(validation$outcome)
+  
+  # ---- Safety: if a class is missing from training, we skip it ----
+  if (nlevels(training$outcome) < length(classes)) next
+  
+  # ---- Random Forest ----
+  rf_classifier <- randomForest(outcome ~ ., data = training, ntree = ntree, importance = TRUE)
+  
+  # ---- Probabilities by class ----
+  prediction_ROC <- predict(rf_classifier, validation[, -1, drop = FALSE], type = "prob")
+  
+  # ---- ROCR : one-vs-rest per class + interpolation ----
+  for (i in seq_along(classes)) {
+    cls <- classes[i]
+    
+    # If the model doesn't have the column (which is possible if the class is missing from the training data), we skip it
+    if (!(cls %in% colnames(prediction_ROC))) next
+    
+    labels <- factor(ifelse(validation$outcome == cls, "pos", "neg"),
+                     levels = c("neg", "pos"))
+    scores <- as.numeric(prediction_ROC[, cls])
+    
+    ok <- !is.na(labels) & !is.na(scores)
+    labels2 <- labels[ok]
+    scores2 <- scores[ok]
+    
+    # If there are no positive or negative results in the validation for this class, ROC analysis is not possible
+    if (length(unique(labels2)) < 2) next
+    
+    pred <- ROCR::prediction(scores2, labels2)
+    perf <- ROCR::performance(pred, "tpr", "fpr")
+    
+    fpr <- perf@x.values[[1]]
+    tpr <- perf@y.values[[1]]
+    
+    # sorted / unique points
+    o <- order(fpr)
+    fpr <- fpr[o]; tpr <- tpr[o]
+    keep <- !duplicated(fpr)
+    fpr <- fpr[keep]; tpr <- tpr[keep]
+    
+    # Interpolation on the common grid
+    tpr_interp <- approx(x = fpr, y = tpr, xout = fpr_grid, rule = 2, ties = "ordered")$y
+    tpr_mat_list[[cls]][, b] <- tpr_interp
+    
+    # AUC
+    auc.perf <- ROCR::performance(pred, "auc")
+    auc_mat[cls, b] <- auc.perf@y.values[[1]]
+  }
+}
+
+# Summary: mean ± SD (based on B repetitions)
+roc_summary <- do.call(rbind, lapply(classes, function(cls) {
+  mat <- tpr_mat_list[[cls]]
+  
+  mean_tpr <- rowMeans(mat, na.rm = TRUE)
+  sd_tpr   <- apply(mat, 1, sd, na.rm = TRUE)
+  
+  data.frame(
+    fpr = fpr_grid,
+    mean = mean_tpr,
+    lower = pmax(0, mean_tpr - sd_tpr),
+    upper = pmin(1, mean_tpr + sd_tpr),
+    class = cls
+  )
+}))
+
+# Plot of mean ROC curve + bands representing standard deviation
+pdf(file = "Fig6E.pdf", height = 6, width = 6)
+colors <- c("#008000", "#800080")  # 4 classes
+
+par(mfrow = c(1, 1), cex = 1.2)
+plot(c(0, 1), c(0, 1), type = "n",
+     xlab = "False Positive Rate (FPR)", ylab = "True Positive Rate (TPR)",
+     main = "")
+
+for (i in seq_along(classes)) {
+  cls <- classes[i]
+  df <- roc_summary[roc_summary$class == cls, ]
+  
+  polygon(
+    x = c(df$fpr, rev(df$fpr)),
+    y = c(df$lower, rev(df$upper)),
+    col = adjustcolor(colors[i], alpha.f = 0.2),
+    border = NA)
+  lines(df$fpr, df$mean, col = colors[i], lwd = 2)}
+
+abline(0, 1, lty = 2)
+
+# Legend: AUC mean ± SD (based on B repetitions)
+auc_mean <- apply(auc_mat, 1, function(x) mean(x, na.rm = TRUE))
+auc_sd   <- apply(auc_mat, 1, function(x) sd(x, na.rm = TRUE))
+
+legend_labels <- sapply(seq_along(classes), function(i) {
+  cls <- classes[i]
+  sprintf("%s (AUC = %.3f ± %.3f)", cls, auc_mean[cls], auc_sd[cls])
+})
+
+legend("bottomright", legend = legend_labels, col = colors[seq_along(classes)], lwd = 2, bty = "n", cex = 1.1)
+
+dev.off()
+
+# classifier
+varImpPlot(rf_classifier)
+print(rf_classifier[["importance"]])
+```
+
