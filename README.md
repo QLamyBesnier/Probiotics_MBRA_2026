@@ -1,7 +1,6 @@
 # Data and code corresponding to the analysis of:
 
-_Lamy-Besnier et al. (2026) *in vitro* modeling of the intestinal microbiota predicts individualized probiotic response in metabolic syndrome
-_
+_Lamy-Besnier et al. (2026) *in vitro* modeling of the intestinal microbiota predicts individualized probiotic response in metabolic syndrome_
 
 ### Data
 
